@@ -1,0 +1,5 @@
+DATA_DIR = "data"
+TRAIN_TRANSACTIONS = "data/ieee-fraud-detection/train_transaction.csv"
+TRAIN_IDENTITY = "data/ieee-fraud-detection/train_identity.csv"
+TEST_TRANSACTIONS = "data/ieee-fraud-detection/test_transaction.csv"
+TEST_IDENTITY = "data/ieee-fraud-detection/test_identity.csv"
