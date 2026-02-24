@@ -59,6 +59,7 @@ def column_types(df: pl.DataFrame, dirpath: Path) -> None:
         dirpath: Directory to save the CSV file.
 
     """
+    dirpath.mkdir(parents=True, exist_ok=True)
     types = pl.DataFrame(
         {name: [str(dtype)] for name, dtype in zip(df.columns, df.dtypes, strict=True)},
     )
@@ -73,6 +74,7 @@ def null_profile(df: pl.DataFrame, dirpath: Path) -> None:
         dirpath: Directory to save the CSV files.
 
     """
+    dirpath.mkdir(parents=True, exist_ok=True)
     null_counts = df.null_count()
     null_percentages = null_counts / len(df)
 
@@ -88,6 +90,7 @@ def correlation_and_variance(df: pl.DataFrame, dirpath: Path) -> None:
         dirpath: Directory to save the CSV files.
 
     """
+    dirpath.mkdir(parents=True, exist_ok=True)
     numeric_df = df.select(cs.numeric())
 
     correlation_matrix = numeric_df.corr()
@@ -105,18 +108,29 @@ def correlation_and_variance(df: pl.DataFrame, dirpath: Path) -> None:
 
 def get_numeric_and_categorical_columns(
     df: pl.DataFrame,
+    exclude_columns: list[str] | None = None,
 ) -> tuple[list[str], list[str]]:
     """Get the names of numeric and categorical columns in a DataFrame.
 
     Args:
         df: The Polars DataFrame.
+        exclude_columns: List of column names to exclude.
 
     Returns:
         A tuple containing lists of numeric and categorical column names.
 
     """
-    numeric_cols: list[str] = df.select(cs.numeric()).columns
-    categorical_cols: list[str] = df.select(cs.string() | cs.categorical()).columns
+    if exclude_columns is None:
+        exclude_columns = []
+
+    numeric_cols: list[str] = [
+        col for col in df.select(cs.numeric()).columns if col not in exclude_columns
+    ]
+    categorical_cols: list[str] = [
+        col
+        for col in df.select(cs.string() | cs.categorical()).columns
+        if col not in exclude_columns
+    ]
     return numeric_cols, categorical_cols
 
 
