@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Any
 
+import joblib
 import numpy as np
 import torch
 from scipy.stats import randint, uniform
@@ -16,7 +17,12 @@ from sklearn.metrics import average_precision_score, make_scorer
 from sklearn.model_selection import RandomizedSearchCV
 from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OrdinalEncoder, StandardScaler
+from sklearn.preprocessing import (
+    OrdinalEncoder,
+    QuantileTransformer,
+    StandardScaler,
+    TargetEncoder,
+)
 from sklearn.utils.multiclass import unique_labels
 from sklearn.utils.validation import check_array, check_is_fitted, check_X_y
 from torch import nn
@@ -51,6 +57,26 @@ def _save_pipeline_results(
     file_path = dirpath / "pipeline_results.json"
     with file_path.open("w") as f:
         json.dump(results, f, indent=4)
+
+
+def _save_best_model(estimator: Pipeline, dirpath: Path) -> None:
+    """Persist the fitted best pipeline (preprocessing + model) to disk.
+
+    Saves the entire fitted Pipeline, so inference reuses the exact fitted
+    preprocessing (TargetEncoder mappings, QuantileTransformer quantiles,
+    imputer statistics) together with the trained classifier. Reload with
+    ``joblib.load(path)`` (with ``src`` importable so the custom
+    ``MCDropoutClassifier`` / ``_MCDropoutNet`` classes resolve). The PyTorch
+    weights are pickled in place; ``predict_proba`` moves the module onto the
+    resolved device on load, so the artifact reloads on CPU or GPU.
+
+    Args:
+        estimator: The fitted pipeline (e.g. ``grid_search.best_estimator_``).
+        dirpath: Directory to save the model into.
+
+    """
+    dirpath.mkdir(parents=True, exist_ok=True)
+    joblib.dump(estimator, dirpath / "best_model.joblib")
 
 
 def _save_grid_search_params(grid_search: Any, dirpath: Path) -> None:
@@ -173,20 +199,28 @@ def mlp_reference(
     if numeric_features is None:
         numeric_features = []
 
+    # Cross-fitted TargetEncoder (CV-safe) replaces OrdinalEncoder: it maps
+    # categories to a meaningful, bounded scale (smoothed P(fraud|category))
+    # instead of arbitrary integer codes, so high-cardinality columns no longer
+    # enter the net unscaled and fake-ordered. StandardScaler then puts the
+    # encoded values on the same ~unit-variance footing as the numerics.
     cat_transformer = Pipeline(
         steps=[
             ("imputer", SimpleImputer(strategy="most_frequent")),
-            (
-                "encoder",
-                OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1),
-            ),
+            ("encoder", TargetEncoder(target_type="binary", random_state=42)),
+            ("scaler", StandardScaler()),
         ],
     )
 
+    # QuantileTransformer is rank-based, so it handles both the heavy tails and
+    # the zero-IQR sparsity that broke RobustScaler (see preprocessing_findings).
     num_transformer = Pipeline(
         steps=[
             ("imputer", SimpleImputer(strategy="median")),
-            ("scaler", StandardScaler()),
+            (
+                "scaler",
+                QuantileTransformer(output_distribution="normal", random_state=42),
+            ),
         ],
     )
 
@@ -373,6 +407,8 @@ class MCDropoutClassifier(ClassifierMixin, BaseEstimator):
         check_is_fitted(self)
         x = check_array(x)
         device = self._resolve_device()
+        # Keep the (possibly just-unpickled) module and inputs on one device.
+        self.module_.to(device)
         x_tensor = torch.as_tensor(np.asarray(x), dtype=torch.float32).to(device)
         log_prior = self._logit_offset(device)
 
@@ -421,6 +457,8 @@ class MCDropoutClassifier(ClassifierMixin, BaseEstimator):
         check_is_fitted(self)
         x = check_array(x)
         device = self._resolve_device()
+        # Keep the (possibly just-unpickled) module and inputs on one device.
+        self.module_.to(device)
         x_tensor = torch.as_tensor(np.asarray(x), dtype=torch.float32).to(device)
         log_prior = self._logit_offset(device)
 
@@ -477,20 +515,28 @@ def bdl_reference(
     if numeric_features is None:
         numeric_features = []
 
+    # Cross-fitted TargetEncoder (CV-safe) replaces OrdinalEncoder: it maps
+    # categories to a meaningful, bounded scale (smoothed P(fraud|category))
+    # instead of arbitrary integer codes, so high-cardinality columns no longer
+    # enter the net unscaled and fake-ordered. StandardScaler then puts the
+    # encoded values on the same ~unit-variance footing as the numerics.
     cat_transformer = Pipeline(
         steps=[
             ("imputer", SimpleImputer(strategy="most_frequent")),
-            (
-                "encoder",
-                OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1),
-            ),
+            ("encoder", TargetEncoder(target_type="binary", random_state=42)),
+            ("scaler", StandardScaler()),
         ],
     )
 
+    # QuantileTransformer is rank-based, so it handles both the heavy tails and
+    # the zero-IQR sparsity that broke RobustScaler (see preprocessing_findings).
     num_transformer = Pipeline(
         steps=[
             ("imputer", SimpleImputer(strategy="median")),
-            ("scaler", StandardScaler()),
+            (
+                "scaler",
+                QuantileTransformer(output_distribution="normal", random_state=42),
+            ),
         ],
     )
 
@@ -564,3 +610,4 @@ def run_pipeline(  # noqa: PLR0913
         grid_search.best_params_,
         dirpath,
     )
+    _save_best_model(grid_search.best_estimator_, dirpath)
