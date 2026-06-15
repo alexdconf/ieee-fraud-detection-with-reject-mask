@@ -17,10 +17,11 @@ from utils.data_handlers import (
     time_series_split,
 )
 from utils.pipeline_tools import (
-    pipeline_nans_passthrough,
-    pipeline_nans_imputed,
+    bdl_reference,
+    mlp_reference,
     run_pipeline,
     save_pipeline_params,
+    xgboost_reference,
 )
 
 if TYPE_CHECKING:
@@ -47,8 +48,10 @@ def merge(
 def main() -> None:
     """Run the main pipeline for IEEE Fraud Detection."""
     try:
-        train_transactions_df = load_csv_data(constants.TRAIN_TRANSACTIONS)  # [:10000]  # comment out for faster testing
-        train_identity_df = load_csv_data(constants.TRAIN_IDENTITY)  # [:10000]
+        train_transactions_df = load_csv_data(
+            constants.TRAIN_TRANSACTIONS
+        )  # [:10000]  # comment out for faster testing
+        # train_identity_df = load_csv_data(constants.TRAIN_IDENTITY)#[:10000]
     except FileNotFoundError as e:
         sys.stderr.write(f"Error loading data from csv file: {e}\n")
         sys.exit(1)
@@ -58,66 +61,65 @@ def main() -> None:
     #####################
     # Try the merged data
     #####################
-    report_name = f"{timestamp}_merged"
-    report_dir = constants.REPORTS_DIR / report_name
-    report_dir.mkdir(parents=True, exist_ok=True)
+    # report_name = f"{timestamp}_merged"
+    # report_dir = constants.REPORTS_DIR / report_name
+    # report_dir.mkdir(parents=True, exist_ok=True)
 
-    merge_df = merge(train_transactions_df, train_identity_df)
+    # merge_df = merge(train_transactions_df, train_identity_df)
 
-    column_types(merge_df, report_dir)
-    null_profile(merge_df, report_dir)
-    correlation_and_variance(merge_df, report_dir)
+    # column_types(merge_df, report_dir)
+    # null_profile(merge_df, report_dir)
+    # correlation_and_variance(merge_df, report_dir)
 
-    # NaNs as is
-    report_name = "raw_nan"
-    raw_report_dir = report_dir / report_name
-    _, merge_cat_cols = get_numeric_and_categorical_columns(
-        merge_df,
-        exclude_columns=[constants.TARGET, constants.TIMESTAMP],
-    )
-    merge_pipeline, merge_param_distributions = pipeline_nans_passthrough(
-        categorical_features=merge_cat_cols,
-    )
-    save_pipeline_params(merge_pipeline, raw_report_dir)
-    x, y, tscv = time_series_split(
-        merge_df,
-        constants.TARGET,
-        constants.TIMESTAMP,
-    )
-    run_pipeline(
-        merge_pipeline,
-        merge_param_distributions,
-        tscv,
-        x,
-        y,
-        raw_report_dir,
-    )
+    # # NaNs as is
+    # report_name = "raw_nan"
+    # raw_report_dir = report_dir / report_name
+    # _, merge_cat_cols = get_numeric_and_categorical_columns(
+    #     merge_df,
+    #     exclude_columns=[constants.TARGET, constants.TIMESTAMP],
+    # )
+    # merge_pipeline, merge_param_distributions = xgboost_reference(
+    #     categorical_features=merge_cat_cols,
+    # )
+    # save_pipeline_params(merge_pipeline, raw_report_dir)
+    # x, y, tscv = time_series_split(
+    #     merge_df,
+    #     constants.TARGET,
+    #     constants.TIMESTAMP,
+    # )
+    # run_pipeline(
+    #     merge_pipeline,
+    #     merge_param_distributions,
+    #     tscv,
+    #     x,
+    #     y,
+    #     raw_report_dir,
+    # )
 
-    # NaNs imputed
-    report_name = "imputed_nan"
-    imputed_report_dir = report_dir / report_name
-    merge_num_cols, merge_cat_cols = get_numeric_and_categorical_columns(
-        merge_df,
-        exclude_columns=[constants.TARGET, constants.TIMESTAMP],
-    )
-    merge_pipeline, merge_param_distributions = pipeline_nans_imputed(
-        categorical_features=merge_cat_cols,
-        numeric_features=merge_num_cols
-    )
-    save_pipeline_params(merge_pipeline, imputed_report_dir)
-    x, y, tscv = time_series_split(
-        merge_df,
-        constants.TARGET,
-        constants.TIMESTAMP,
-    )
-    run_pipeline(
-        merge_pipeline,
-        merge_param_distributions,
-        tscv,
-        x,
-        y,
-        imputed_report_dir,
-    )
+    # # NaNs imputed
+    # report_name = "imputed_nan"
+    # imputed_report_dir = report_dir / report_name
+    # merge_num_cols, merge_cat_cols = get_numeric_and_categorical_columns(
+    #     merge_df,
+    #     exclude_columns=[constants.TARGET, constants.TIMESTAMP],
+    # )
+    # merge_pipeline, merge_param_distributions = mlp_reference(
+    #     categorical_features=merge_cat_cols, numeric_features=merge_num_cols
+    # )
+    # save_pipeline_params(merge_pipeline, imputed_report_dir)
+    # x, y, tscv = time_series_split(
+    #     merge_df,
+    #     constants.TARGET,
+    #     constants.TIMESTAMP,
+    # )
+    # run_pipeline(
+    #     merge_pipeline,
+    #     merge_param_distributions,
+    #     tscv,
+    #     x,
+    #     y,
+    #     imputed_report_dir,
+    # )
     #####################
     # Try the merged data
     #####################
@@ -134,40 +136,65 @@ def main() -> None:
     correlation_and_variance(train_transactions_df, report_dir)
 
     # NaNs as is
-    report_name = "raw_nan"
-    raw_report_dir = report_dir / report_name
-    _, trans_cat_cols = get_numeric_and_categorical_columns(
-        train_transactions_df,
-        exclude_columns=[constants.TARGET, constants.TIMESTAMP],
-    )
-    transactions_pipeline, transactions_param_distributions = pipeline_nans_passthrough(
-        categorical_features=trans_cat_cols,
-    )
-    save_pipeline_params(transactions_pipeline, raw_report_dir)
-    x, y, tscv = time_series_split(
-        train_transactions_df,
-        constants.TARGET,
-        constants.TIMESTAMP,
-    )
-    run_pipeline(
-        transactions_pipeline,
-        transactions_param_distributions,
-        tscv,
-        x,
-        y,
-        raw_report_dir,
-    )
+    # report_name = "xgboost_reference"
+    # raw_report_dir = report_dir / report_name
+    # _, trans_cat_cols = get_numeric_and_categorical_columns(
+    #     train_transactions_df,
+    #     exclude_columns=[constants.TARGET, constants.TIMESTAMP],
+    # )
+    # transactions_pipeline, transactions_param_distributions = xgboost_reference(
+    #     categorical_features=trans_cat_cols,
+    # )
+    # save_pipeline_params(transactions_pipeline, raw_report_dir)
+    # x, y, tscv = time_series_split(
+    #     train_transactions_df,
+    #     constants.TARGET,
+    #     constants.TIMESTAMP,
+    # )
+    # run_pipeline(
+    #     transactions_pipeline,
+    #     transactions_param_distributions,
+    #     tscv,
+    #     x,
+    #     y,
+    #     raw_report_dir,
+    # )
 
-    # NaNs imputed
-    report_name = "imputed_nan"
+    # NaNs imputed: MLP
+    # report_name = "mlp_reference"
+    # imputed_report_dir = report_dir / report_name
+    # trans_num_cols, trans_cat_cols = get_numeric_and_categorical_columns(
+    #     train_transactions_df,
+    #     exclude_columns=[constants.TARGET, constants.TIMESTAMP],
+    # )
+    # transactions_pipeline, transactions_param_distributions = mlp_reference(
+    #     categorical_features=trans_cat_cols, numeric_features=trans_num_cols
+    # )
+    # save_pipeline_params(transactions_pipeline, imputed_report_dir)
+    # x, y, tscv = time_series_split(
+    #     train_transactions_df,
+    #     constants.TARGET,
+    #     constants.TIMESTAMP,
+    # )
+    # run_pipeline(
+    #     transactions_pipeline,
+    #     transactions_param_distributions,
+    #     tscv,
+    #     x,
+    #     y,
+    #     imputed_report_dir,
+    # )
+
+    # NaNs imputed: BDL
+    report_name = "bdl_reference"
+    print(f"report name: {report_name}")
     imputed_report_dir = report_dir / report_name
     trans_num_cols, trans_cat_cols = get_numeric_and_categorical_columns(
         train_transactions_df,
         exclude_columns=[constants.TARGET, constants.TIMESTAMP],
     )
-    transactions_pipeline, transactions_param_distributions = pipeline_nans_imputed(
-        categorical_features=trans_cat_cols,
-        numeric_features=trans_num_cols
+    transactions_pipeline, transactions_param_distributions = bdl_reference(
+        categorical_features=trans_cat_cols, numeric_features=trans_num_cols
     )
     save_pipeline_params(transactions_pipeline, imputed_report_dir)
     x, y, tscv = time_series_split(
