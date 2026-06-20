@@ -159,7 +159,12 @@ def xgboost_reference(
         remainder="passthrough",
     )
 
-    clf = XGBClassifier(objective="binary:logistic", device="cuda")
+    # CPU hist: the sklearn Pipeline feeds host (CPU) numpy, so device="cuda"
+    # forced a CPU->GPU copy / DMatrix fallback every call. On this tabular size
+    # CPU hist avoids that overhead and the device-mismatch warning.
+    clf = XGBClassifier(
+        objective="binary:logistic", tree_method="hist", device="cpu", n_jobs=2
+    )
     pipe = Pipeline(
         steps=[
             ("preprocessor", preprocessor),
@@ -397,9 +402,7 @@ class MCDropoutClassifier(ClassifierMixin, BaseEstimator):
         probabilities. None when no correction applies.
         """
         if self.prior_correction and self.log_prior_ is not None:
-            return torch.as_tensor(
-                self.log_prior_, dtype=torch.float32, device=device
-            )
+            return torch.as_tensor(self.log_prior_, dtype=torch.float32, device=device)
         return None
 
     def predict_proba(self, x: Any) -> np.ndarray:  # noqa: ANN401

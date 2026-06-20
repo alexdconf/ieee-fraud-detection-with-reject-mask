@@ -135,30 +135,30 @@ def main() -> None:
     null_profile(train_transactions_df, report_dir)
     correlation_and_variance(train_transactions_df, report_dir)
 
-    # NaNs as is
-    # report_name = "xgboost_reference"
-    # raw_report_dir = report_dir / report_name
-    # _, trans_cat_cols = get_numeric_and_categorical_columns(
-    #     train_transactions_df,
-    #     exclude_columns=[constants.TARGET, constants.TIMESTAMP],
-    # )
-    # transactions_pipeline, transactions_param_distributions = xgboost_reference(
-    #     categorical_features=trans_cat_cols,
-    # )
-    # save_pipeline_params(transactions_pipeline, raw_report_dir)
-    # x, y, tscv = time_series_split(
-    #     train_transactions_df,
-    #     constants.TARGET,
-    #     constants.TIMESTAMP,
-    # )
-    # run_pipeline(
-    #     transactions_pipeline,
-    #     transactions_param_distributions,
-    #     tscv,
-    #     x,
-    #     y,
-    #     raw_report_dir,
-    # )
+    # NaNs as is: xgboost
+    report_name = "xgboost_reference"
+    raw_report_dir = report_dir / report_name
+    _, trans_cat_cols = get_numeric_and_categorical_columns(
+        train_transactions_df,
+        exclude_columns=[constants.TARGET, constants.TIMESTAMP],
+    )
+    transactions_pipeline, transactions_param_distributions = xgboost_reference(
+        categorical_features=trans_cat_cols,
+    )
+    save_pipeline_params(transactions_pipeline, raw_report_dir)
+    x, y, tscv = time_series_split(
+        train_transactions_df,
+        constants.TARGET,
+        constants.TIMESTAMP,
+    )
+    run_pipeline(
+        transactions_pipeline,
+        transactions_param_distributions,
+        tscv,
+        x,
+        y,
+        raw_report_dir,
+    )
 
     # NaNs imputed: MLP
     # report_name = "mlp_reference"
