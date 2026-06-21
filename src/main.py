@@ -27,6 +27,11 @@ from utils.pipeline_tools import (
     save_pipeline_params,
     xgboost_reference,
 )
+from utils.reference_sets import (
+    all_training_reference,
+    resolve_reference,
+    save_reference_report,
+)
 
 if TYPE_CHECKING:
     import polars as pl
@@ -235,21 +240,56 @@ def main() -> None:
     # test set never seen during EDA/CV/refit. Surfaces PR-AUC and precision for
     # XGBoost, BDL without a reject mask, and BDL with a reject mask, writing the
     # side-by-side comparison to report_dir/test_comparison.json. The BDL reject
-    # mask rejects test data whose Bayes Error exceeds the reference computed by
-    # inferring the full training set (x); here x is exactly that training set.
+    # mask rejects test data whose Bayes Error exceeds a reference scalar computed
+    # from a *reference set* (x_reference).
     x_test, y_test = features_and_target(
         test_df,
         constants.TARGET,
         constants.TIMESTAMP,
     )
 
+    # The reference set is now a declared, serializable ReferenceSpec rather than
+    # an implicit "all of training". The default spec reproduces the first-cut
+    # behaviour (x_reference == all of train_df); resolving it both builds the
+    # x_reference matrix and records its provenance (reference_spec.json) so the
+    # test comparison can be traced back to the subset it was calibrated against.
+    # To calibrate against a *subset of interest* instead, swap in a different
+    # spec here (e.g. one returned by find_subsets_of_interest, or a hand-written
+    # ReferenceSpec) and pass model=bdl_model for uncertainty-based selectors.
+    reference_spec = all_training_reference()
+    x_reference, reference_provenance = resolve_reference(
+        reference_spec,
+        train_df,
+        constants.TARGET,
+        constants.TIMESTAMP,
+        model=bdl_model,
+    )
+    save_reference_report(reference_provenance, report_dir)
+
+    # Discovery scaffold: surface candidate reference subsets ranked by an
+    # (currently placeholder) interestingness score, written to
+    # report_dir/subsets_of_interest.json. Off by default because the
+    # model-driven strategies run MC-dropout passes over train_df; enable while
+    # exploring (ideally on a subset) and promote a candidate by copying its spec
+    # into reference_spec above.
+    # from utils.subset_finder import find_subsets_of_interest
+    # find_subsets_of_interest(
+    #     train_df,
+    #     model=bdl_model,
+    #     target=constants.TARGET,
+    #     timestamp=constants.TIMESTAMP,
+    #     dirpath=report_dir,
+    #     with_uncertainty=True,
+    # )
+
     compare_models_on_test(
         xgb_model,
         bdl_model,
-        x,
+        x_reference,
         x_test,
         y_test,
         report_dir,
+        reference_provenance=reference_provenance,
     )
     #############################################
     # Try just transactions without the left join

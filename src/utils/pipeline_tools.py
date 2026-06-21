@@ -855,6 +855,7 @@ def compare_models_on_test(  # noqa: PLR0913
     y_test: np.ndarray,
     dirpath: Path,
     reduction: str = "mean",
+    reference_provenance: dict[str, Any] | None = None,
 ) -> dict[str, dict[str, float]]:
     """Evaluate XGBoost and BDL (with and without reject mask) on the test set.
 
@@ -862,32 +863,44 @@ def compare_models_on_test(  # noqa: PLR0913
     persists them to ``test_comparison.json`` in ``dirpath`` for comparison:
     ``xgboost``, ``bdl_no_reject_mask`` and ``bdl_reject_mask``. The reject mask
     rejects a test datum whose Bayes Error exceeds the reference computed from
-    ``x_reference`` (the full training set).
+    ``x_reference``.
+
+    ``x_reference`` no longer has to be the full training set: it is whatever
+    matrix a :class:`~utils.reference_sets.ReferenceSpec` resolved to. Pass the
+    matching ``reference_provenance`` (from ``resolve_reference``) so the saved
+    comparison records *which* reference subset it was calibrated against, under a
+    ``"reference"`` key, instead of leaving it implicit.
 
     Args:
         xgb_model: The XGBoost pipeline fitted on the full training set.
         bdl_model: The BDL pipeline fitted on the full training set.
-        x_reference: The reference (full training) features for the BDL Bayes
-            Error reference.
+        x_reference: The reference features for the BDL Bayes Error reference
+            (the full training set, or a resolved subset of interest).
         x_test: The held-out test features (same column layout as training X).
         y_test: The held-out test labels.
         dirpath: Directory to write the comparison JSON into.
         reduction: How to reduce the reference Bayes Errors to one scalar
             (passed to ``bayes_error_reference``).
+        reference_provenance: Optional provenance dict (from
+            ``resolve_reference``) describing how ``x_reference`` was selected;
+            embedded in the output under ``"reference"`` when given.
 
     Returns:
-        A dict keyed by configuration name, each holding that config's metrics.
+        A dict keyed by configuration name, each holding that config's metrics
+        (plus a ``"reference"`` entry when ``reference_provenance`` is provided).
 
     """
     reference = bayes_error_reference(bdl_model, x_reference, reduction=reduction)
     bdl_no_mask, bdl_reject_mask = evaluate_bdl_on_test(
         bdl_model, x_test, y_test, reference
     )
-    results = {
+    results: dict[str, Any] = {
         "xgboost": evaluate_on_test(xgb_model, x_test, y_test),
         "bdl_no_reject_mask": bdl_no_mask,
         "bdl_reject_mask": bdl_reject_mask,
     }
+    if reference_provenance is not None:
+        results["reference"] = reference_provenance
 
     dirpath.mkdir(parents=True, exist_ok=True)
     file_path = dirpath / _TEST_COMPARISON_FILENAME
