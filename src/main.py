@@ -6,6 +6,8 @@ import sys
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+import numpy as np
+
 import constants
 from utils.data_handlers import (
     column_types,
@@ -27,14 +29,11 @@ from utils.pipeline_tools import (
     save_pipeline_params,
     xgboost_reference,
 )
-from utils.reference_sets import (
-    all_training_reference,
-    resolve_reference,
-    save_reference_report,
-)
 
 if TYPE_CHECKING:
     import polars as pl
+    from pandas import DataFrame as pdDataFrame
+    from sklearn.pipeline import Pipeline
 
 
 def merge(
@@ -52,6 +51,42 @@ def merge(
 
     """
     return merge_transaction_and_identity(train_transactions_df, train_identity_df)
+
+
+def trouble_reference(
+    model: Pipeline,
+    x: pdDataFrame,
+    *,
+    metric: str = "bayes_error",
+    quantile: float = 0.95,
+) -> pdDataFrame:
+    """Select the reference subset the model is most uncertain about.
+
+    Scores every row of ``x`` through the fitted BDL ``model`` with one
+    MC-dropout pass and keeps the upper tail of ``metric`` -- by default the top
+    5% by Bayes Error, the exact quantity the reject mask thresholds. This is the
+    "all-weird" reference (notes/bdl_imbalance_calibration.md §5): rows the model
+    demonstrably has trouble with, so the mask only rejects test data more
+    uncertain than cases already known to be hard.
+
+    Args:
+        model: The BDL pipeline fitted on the training set (its final step must
+            expose ``uncertainty_metrics``).
+        x: Training features to draw the reference subset from.
+        metric: Which per-sample uncertainty metric to rank by (e.g.
+            ``"bayes_error"`` or ``"bald"``).
+        quantile: Lower bound of the retained upper tail (``0.95`` keeps the most
+            uncertain 5%).
+
+    Returns:
+        The subset of ``x`` in the upper ``1 - quantile`` tail of ``metric``.
+
+    """
+    classifier = model[-1]
+    x_pre = model[:-1].transform(x)
+    values = classifier.uncertainty_metrics(x_pre)[metric]
+    threshold = np.quantile(values, quantile)
+    return x[values >= threshold]
 
 
 def main() -> None:
@@ -248,39 +283,11 @@ def main() -> None:
         constants.TIMESTAMP,
     )
 
-    # The reference set is now a declared, serializable ReferenceSpec rather than
-    # an implicit "all of training". The default spec reproduces the first-cut
-    # behaviour (x_reference == all of train_df); resolving it both builds the
-    # x_reference matrix and records its provenance (reference_spec.json) so the
-    # test comparison can be traced back to the subset it was calibrated against.
-    # To calibrate against a *subset of interest* instead, swap in a different
-    # spec here (e.g. one returned by find_subsets_of_interest, or a hand-written
-    # ReferenceSpec) and pass model=bdl_model for uncertainty-based selectors.
-    reference_spec = all_training_reference()
-    x_reference, reference_provenance = resolve_reference(
-        reference_spec,
-        train_df,
-        constants.TARGET,
-        constants.TIMESTAMP,
-        model=bdl_model,
-    )
-    save_reference_report(reference_provenance, report_dir)
-
-    # Discovery scaffold: surface candidate reference subsets ranked by an
-    # (currently placeholder) interestingness score, written to
-    # report_dir/subsets_of_interest.json. Off by default because the
-    # model-driven strategies run MC-dropout passes over train_df; enable while
-    # exploring (ideally on a subset) and promote a candidate by copying its spec
-    # into reference_spec above.
-    # from utils.subset_finder import find_subsets_of_interest
-    # find_subsets_of_interest(
-    #     train_df,
-    #     model=bdl_model,
-    #     target=constants.TARGET,
-    #     timestamp=constants.TIMESTAMP,
-    #     dirpath=report_dir,
-    #     with_uncertainty=True,
-    # )
+    # Reference set for the BDL reject mask: the rows the model is most uncertain
+    # about (top 5% by Bayes Error). The mask thresholds test data against the
+    # mean Bayes Error of this "all-weird" reference, so it only rejects points
+    # weirder than cases the model already demonstrably struggles with.
+    x_reference = trouble_reference(bdl_model, x)
 
     compare_models_on_test(
         xgb_model,
@@ -289,7 +296,6 @@ def main() -> None:
         x_test,
         y_test,
         report_dir,
-        reference_provenance=reference_provenance,
     )
     #############################################
     # Try just transactions without the left join

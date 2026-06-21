@@ -101,7 +101,7 @@ def _save_grid_search_params(grid_search: Any, dirpath: Path) -> None:
         try:
             json.dumps(value)
             serializable_params[key] = value
-        except (TypeError, OverflowError):
+        except TypeError, OverflowError:
             serializable_params[key] = str(value)
 
     file_path = dirpath / "grid_search_params.json"
@@ -125,7 +125,7 @@ def save_pipeline_params(pipeline: Pipeline, dirpath: Path) -> None:
         try:
             json.dumps(value)
             serializable_params[key] = value
-        except (TypeError, OverflowError):
+        except TypeError, OverflowError:
             serializable_params[key] = str(value)
 
     file_path = dirpath / "pipeline_params.json"
@@ -855,7 +855,6 @@ def compare_models_on_test(  # noqa: PLR0913
     y_test: np.ndarray,
     dirpath: Path,
     reduction: str = "mean",
-    reference_provenance: dict[str, Any] | None = None,
 ) -> dict[str, dict[str, float]]:
     """Evaluate XGBoost and BDL (with and without reject mask) on the test set.
 
@@ -899,8 +898,6 @@ def compare_models_on_test(  # noqa: PLR0913
         "bdl_no_reject_mask": bdl_no_mask,
         "bdl_reject_mask": bdl_reject_mask,
     }
-    if reference_provenance is not None:
-        results["reference"] = reference_provenance
 
     dirpath.mkdir(parents=True, exist_ok=True)
     file_path = dirpath / _TEST_COMPARISON_FILENAME
