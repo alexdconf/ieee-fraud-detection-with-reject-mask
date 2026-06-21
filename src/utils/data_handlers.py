@@ -134,6 +134,60 @@ def get_numeric_and_categorical_columns(
     return numeric_cols, categorical_cols
 
 
+def holdout_test_split(
+    df: pl.DataFrame,
+    timestamp: str,
+    test_fraction: float = 0.2,
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Chronologically split off the most recent rows as a held-out test set.
+
+    Sorts by ``timestamp`` and assigns the final ``test_fraction`` of rows to the
+    test set, mirroring the forward-in-time evaluation that ``TimeSeriesSplit``
+    uses during CV. The earlier rows are returned as the training set used for
+    both cross-validation and the full refit; the test set is reserved for later
+    evaluation and never seen during training.
+
+    Args:
+        df: The Polars DataFrame.
+        timestamp: The name of the column to sort by.
+        test_fraction: Fraction of rows (most recent) to hold out for testing.
+
+    Returns:
+        A tuple ``(train_df, test_df)`` sorted by ``timestamp``.
+
+    """
+    df_sorted = df.sort(timestamp)
+    n_test = int(len(df_sorted) * test_fraction)
+    n_train = len(df_sorted) - n_test
+    return df_sorted.head(n_train), df_sorted.tail(n_test)
+
+
+def features_and_target(
+    df: pl.DataFrame,
+    target: str,
+    timestamp: str,
+) -> tuple[pdDataFrame, np.ndarray]:
+    """Split a DataFrame into features (X) and target (y), sorted by timestamp.
+
+    Produces the same chronologically-sorted, target-excluded feature matrix that
+    ``time_series_split`` builds, so a pipeline fitted on the training X can be
+    evaluated on a held-out test set with an identical column layout.
+
+    Args:
+        df: The Polars DataFrame.
+        target: The name of the target column.
+        timestamp: The name of the column to sort by.
+
+    Returns:
+        A tuple containing the features (X) and the target (y).
+
+    """
+    df_sorted = df.sort(timestamp)
+    x = df_sorted.select(pl.all().exclude(target)).to_pandas()
+    y = df_sorted.select(target).to_pandas().to_numpy().ravel()
+    return x, y
+
+
 def time_series_split(
     df: pl.DataFrame,
     target: str,
@@ -155,8 +209,6 @@ def time_series_split(
         TimeSeriesSplit object.
 
     """
-    df_sorted = df.sort(timestamp)
-    x = df_sorted.select(pl.all().exclude(target)).to_pandas()
-    y = df_sorted.select(target).to_pandas().to_numpy().ravel()
+    x, y = features_and_target(df, target, timestamp)
     tscv = TimeSeriesSplit(gap=gap, n_splits=n_splits)
     return x, y, tscv

@@ -10,10 +10,10 @@ import numpy as np
 import torch
 from scipy.stats import randint, uniform
 from scipy.stats.distributions import loguniform
-from sklearn.base import BaseEstimator, ClassifierMixin
+from sklearn.base import BaseEstimator, ClassifierMixin, clone
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import average_precision_score, make_scorer
+from sklearn.metrics import average_precision_score, make_scorer, precision_score
 from sklearn.model_selection import RandomizedSearchCV
 from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import Pipeline
@@ -36,6 +36,11 @@ if TYPE_CHECKING:
     from sklearn.model_selection import TimeSeriesSplit
 
 
+# Filename used both when persisting CV results and when reading them back to
+# refit on the full training set (see fit_full_model).
+_RESULTS_FILENAME = "pipeline_results.json"
+
+
 def _save_pipeline_results(
     best_score: float,
     best_params: dict[str, Any],
@@ -54,7 +59,7 @@ def _save_pipeline_results(
         "best_score": best_score,
         "best_params": best_params,
     }
-    file_path = dirpath / "pipeline_results.json"
+    file_path = dirpath / _RESULTS_FILENAME
     with file_path.open("w") as f:
         json.dump(results, f, indent=4)
 
@@ -71,7 +76,8 @@ def _save_best_model(estimator: Pipeline, dirpath: Path) -> None:
     resolved device on load, so the artifact reloads on CPU or GPU.
 
     Args:
-        estimator: The fitted pipeline (e.g. ``grid_search.best_estimator_``).
+        estimator: The pipeline fitted on the full training set (the model
+            returned by ``fit_full_model``).
         dirpath: Directory to save the model into.
 
     """
@@ -95,7 +101,7 @@ def _save_grid_search_params(grid_search: Any, dirpath: Path) -> None:
         try:
             json.dumps(value)
             serializable_params[key] = value
-        except TypeError, OverflowError:
+        except (TypeError, OverflowError):
             serializable_params[key] = str(value)
 
     file_path = dirpath / "grid_search_params.json"
@@ -119,7 +125,7 @@ def save_pipeline_params(pipeline: Pipeline, dirpath: Path) -> None:
         try:
             json.dumps(value)
             serializable_params[key] = value
-        except TypeError, OverflowError:
+        except (TypeError, OverflowError):
             serializable_params[key] = str(value)
 
     file_path = dirpath / "pipeline_params.json"
@@ -594,6 +600,10 @@ def run_pipeline(  # noqa: PLR0913
         average_precision_score, response_method="predict_proba"
     )
 
+    # refit=False: the search only selects hyperparameters here. The single
+    # full-training-set fit (and the saved best_model.joblib) is produced by
+    # fit_full_model, so refitting best_estimator_ on all of x, y would be a
+    # wasted training pass (notably for the BDL torch model).
     grid_search = RandomizedSearchCV(
         estimator=pipe,
         param_distributions=param_distributions,
@@ -602,6 +612,7 @@ def run_pipeline(  # noqa: PLR0913
         n_jobs=n_jobs,
         verbose=1,
         random_state=42,
+        refit=False,
     )
 
     _save_grid_search_params(grid_search, dirpath)
@@ -613,4 +624,274 @@ def run_pipeline(  # noqa: PLR0913
         grid_search.best_params_,
         dirpath,
     )
-    _save_best_model(grid_search.best_estimator_, dirpath)
+
+
+def fit_full_model(
+    pipe: Pipeline,
+    x: pdDataFrame,
+    y: Any,  # noqa: ANN401
+    dirpath: Path,
+) -> Pipeline:
+    """Refit a pipeline on the full training set using the best CV params.
+
+    Reads ``best_params`` from the ``pipeline_results.json`` written by
+    ``run_pipeline`` in ``dirpath``, applies them to a fresh clone of ``pipe``,
+    and fits once on the entire provided training set (no cross-validation
+    holdout). The fitted model is persisted to ``dirpath`` via
+    ``_save_best_model``. This is deliberately separate from the CV search: CV
+    selects the hyperparameters, this turns them into the deployable model.
+
+    Args:
+        pipe: An unfitted pipeline of the same structure used during the search
+            (e.g. the one returned by ``xgboost_reference``/``bdl_reference``).
+        x: The full training feature DataFrame.
+        y: The full training target.
+        dirpath: Directory holding ``pipeline_results.json``; the fitted model
+            is saved here too.
+
+    Returns:
+        The pipeline fitted on the full training set.
+
+    """
+    results_path = dirpath / _RESULTS_FILENAME
+    with results_path.open() as f:
+        best_params = json.load(f)["best_params"]
+
+    model = clone(pipe)
+    model.set_params(**best_params)
+    model.fit(x, y)
+
+    _save_best_model(model, dirpath)
+    return model
+
+
+# Filename used to persist the side-by-side test-set comparison (see
+# compare_models_on_test).
+_TEST_COMPARISON_FILENAME = "test_comparison.json"
+
+
+def _binary_metrics(
+    y_true: np.ndarray,
+    y_score: np.ndarray,
+    y_pred: np.ndarray,
+) -> dict[str, float]:
+    """Compute PR-AUC (from scores) and precision (from hard labels).
+
+    PR-AUC is a ranking metric and needs the continuous positive-class score;
+    precision needs the model's hard decision. Keeping the two inputs separate
+    (rather than re-thresholding the score here) means precision reflects the
+    model's own decision rule and stays consistent with ``y_score`` even for the
+    stochastic BDL model, where ``y_pred`` is the ``argmax`` of the same pass.
+
+    Args:
+        y_true: Ground-truth binary labels.
+        y_score: Predicted probability of the positive (fraud) class.
+        y_pred: The model's predicted hard labels.
+
+    Returns:
+        A dict with ``pr_auc``, ``precision`` and the supporting ``n_samples``.
+
+    """
+    return {
+        "pr_auc": float(average_precision_score(y_true, y_score)),
+        "precision": float(precision_score(y_true, y_pred, zero_division=0)),
+        "n_samples": int(len(y_true)),
+    }
+
+
+def evaluate_on_test(
+    model: Pipeline,
+    x_test: pdDataFrame,
+    y_test: np.ndarray,
+) -> dict[str, float]:
+    """Score a fitted pipeline on the held-out test set.
+
+    Takes a single ``predict_proba`` pass and derives the hard label by
+    ``argmax`` of those same probabilities — identical to ``model.predict`` but
+    guaranteed to match the scores PR-AUC is computed from (and, for the BDL
+    model, computed from one MC-dropout pass rather than a second independent
+    one). Applies to any ``predict_proba`` pipeline: XGBoost, and the BDL model
+    evaluated *without* a reject mask.
+
+    Args:
+        model: A pipeline already fitted on the full training set.
+        x_test: The held-out test features (same column layout as training X).
+        y_test: The held-out test labels.
+
+    Returns:
+        A dict of test metrics (``pr_auc``, ``precision``, ``n_samples``).
+
+    """
+    proba = model.predict_proba(x_test)
+    y_pred = model.classes_[np.argmax(proba, axis=1)]
+    return _binary_metrics(y_test, proba[:, 1], y_pred)
+
+
+# Reductions for collapsing the reference set's per-sample Bayes Error into the
+# single scalar that each test datum is compared against. Bayes Error is bounded
+# in [0, 0.5] for binary classification, so "max" tends to saturate near 0.5 and
+# reject nothing; "mean" gives a meaningful operating point to start from.
+_BAYES_ERROR_REDUCTIONS = {
+    "mean": np.mean,
+    "median": np.median,
+    "max": np.max,
+}
+
+
+def bayes_error_reference(
+    model: Pipeline,
+    x_reference: pdDataFrame,
+    reduction: str = "mean",
+) -> float:
+    """Compute the reference Bayes Error from a reference (e.g. training) set.
+
+    Infers ``x_reference`` through the fitted BDL pipeline (one MC-dropout pass
+    via ``MCDropoutClassifier.uncertainty_metrics``) and reduces the per-sample
+    Bayes Error to a single scalar. A test datum is later rejected when its own
+    Bayes Error exceeds this reference (see ``evaluate_bdl_on_test``).
+
+    Args:
+        model: The BDL pipeline fitted on the full training set.
+        x_reference: Features of the reference set (the full training set here).
+        reduction: How to collapse the reference Bayes Errors into one scalar;
+            one of ``"mean"``, ``"median"`` or ``"max"``.
+
+    Returns:
+        The reference Bayes Error scalar.
+
+    """
+    classifier = model[-1]
+    x_pre = model[:-1].transform(x_reference)
+    bayes_error = classifier.uncertainty_metrics(x_pre)["bayes_error"]
+    return float(_BAYES_ERROR_REDUCTIONS[reduction](bayes_error))
+
+
+def _masked_metrics(
+    y_true: np.ndarray,
+    y_score: np.ndarray,
+    y_pred: np.ndarray,
+    keep_mask: np.ndarray,
+) -> dict[str, float | None]:
+    """Score the retained subset, reporting coverage and rejection counts.
+
+    Guards the empty case (every sample rejected), where PR-AUC and precision are
+    undefined, by returning ``None`` for those metrics rather than raising.
+
+    Args:
+        y_true: Ground-truth binary labels for all test samples.
+        y_score: Positive-class probability for all test samples.
+        y_pred: Predicted hard labels for all test samples.
+        keep_mask: Boolean mask, ``True`` where a sample is kept (not rejected).
+
+    Returns:
+        A dict with the retained-subset metrics plus ``coverage`` and
+        ``n_rejected``.
+
+    """
+    result: dict[str, float | None] = {
+        "coverage": float(keep_mask.mean()),
+        "n_rejected": int((~keep_mask).sum()),
+    }
+    if not keep_mask.any():
+        result.update({"pr_auc": None, "precision": None, "n_samples": 0})
+        return result
+    result.update(
+        _binary_metrics(y_true[keep_mask], y_score[keep_mask], y_pred[keep_mask])
+    )
+    return result
+
+
+def evaluate_bdl_on_test(
+    model: Pipeline,
+    x_test: pdDataFrame,
+    y_test: np.ndarray,
+    reference_bayes_error: float,
+) -> tuple[dict[str, float], dict[str, float | None]]:
+    """Evaluate the BDL pipeline on test, both without and with the reject mask.
+
+    Runs a single MC-dropout pass over the test set via ``uncertainty_metrics``,
+    so the no-mask metrics, the reject-mask metrics and the rejection decision
+    all derive from the same predictive distribution (and the test set is not
+    inferred twice). The hard label is the ``argmax`` of the predictive mean
+    (matching ``predict``). A test datum is rejected when its Bayes Error exceeds
+    ``reference_bayes_error``; the kept subset is scored for the masked metrics.
+
+    Args:
+        model: The BDL pipeline fitted on the full training set (its final step
+            is an ``MCDropoutClassifier``).
+        x_test: The held-out test features (same column layout as training X).
+        y_test: The held-out test labels.
+        reference_bayes_error: The reference scalar from
+            ``bayes_error_reference``.
+
+    Returns:
+        ``(no_mask_metrics, reject_mask_metrics)``. The masked dict also carries
+        ``coverage``, ``n_rejected`` and the ``reference_bayes_error`` applied.
+
+    """
+    classifier = model[-1]
+    x_pre = model[:-1].transform(x_test)
+    metrics = classifier.uncertainty_metrics(x_pre)
+    proba = metrics["mean_proba"]
+    y_score = proba[:, 1]
+    y_pred = classifier.classes_[np.argmax(proba, axis=1)]
+
+    no_mask = _binary_metrics(y_test, y_score, y_pred)
+
+    # Reject any test datum more uncertain (higher Bayes Error) than the
+    # training reference; keep the rest.
+    keep_mask = metrics["bayes_error"] <= reference_bayes_error
+    reject_mask = _masked_metrics(y_test, y_score, y_pred, keep_mask)
+    reject_mask["reference_bayes_error"] = reference_bayes_error
+
+    return no_mask, reject_mask
+
+
+def compare_models_on_test(  # noqa: PLR0913
+    xgb_model: Pipeline,
+    bdl_model: Pipeline,
+    x_reference: pdDataFrame,
+    x_test: pdDataFrame,
+    y_test: np.ndarray,
+    dirpath: Path,
+    reduction: str = "mean",
+) -> dict[str, dict[str, float]]:
+    """Evaluate XGBoost and BDL (with and without reject mask) on the test set.
+
+    Surfaces PR-AUC and precision for three configurations side by side and
+    persists them to ``test_comparison.json`` in ``dirpath`` for comparison:
+    ``xgboost``, ``bdl_no_reject_mask`` and ``bdl_reject_mask``. The reject mask
+    rejects a test datum whose Bayes Error exceeds the reference computed from
+    ``x_reference`` (the full training set).
+
+    Args:
+        xgb_model: The XGBoost pipeline fitted on the full training set.
+        bdl_model: The BDL pipeline fitted on the full training set.
+        x_reference: The reference (full training) features for the BDL Bayes
+            Error reference.
+        x_test: The held-out test features (same column layout as training X).
+        y_test: The held-out test labels.
+        dirpath: Directory to write the comparison JSON into.
+        reduction: How to reduce the reference Bayes Errors to one scalar
+            (passed to ``bayes_error_reference``).
+
+    Returns:
+        A dict keyed by configuration name, each holding that config's metrics.
+
+    """
+    reference = bayes_error_reference(bdl_model, x_reference, reduction=reduction)
+    bdl_no_mask, bdl_reject_mask = evaluate_bdl_on_test(
+        bdl_model, x_test, y_test, reference
+    )
+    results = {
+        "xgboost": evaluate_on_test(xgb_model, x_test, y_test),
+        "bdl_no_reject_mask": bdl_no_mask,
+        "bdl_reject_mask": bdl_reject_mask,
+    }
+
+    dirpath.mkdir(parents=True, exist_ok=True)
+    file_path = dirpath / _TEST_COMPARISON_FILENAME
+    with file_path.open("w") as f:
+        json.dump(results, f, indent=4)
+
+    return results
