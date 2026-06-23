@@ -13,7 +13,13 @@ from scipy.stats.distributions import loguniform
 from sklearn.base import BaseEstimator, ClassifierMixin, clone
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import average_precision_score, make_scorer, precision_score
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    make_scorer,
+    precision_score,
+    recall_score,
+)
 from sklearn.model_selection import RandomizedSearchCV
 from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import Pipeline
@@ -30,6 +36,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from xgboost import XGBClassifier
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from pathlib import Path
 
     from pandas import DataFrame as pdDataFrame
@@ -675,13 +682,14 @@ def _binary_metrics(
     y_score: np.ndarray,
     y_pred: np.ndarray,
 ) -> dict[str, float]:
-    """Compute PR-AUC (from scores) and precision (from hard labels).
+    """Compute PR-AUC (from scores) and precision/recall/accuracy (hard labels).
 
-    PR-AUC is a ranking metric and needs the continuous positive-class score;
-    precision needs the model's hard decision. Keeping the two inputs separate
-    (rather than re-thresholding the score here) means precision reflects the
-    model's own decision rule and stays consistent with ``y_score`` even for the
-    stochastic BDL model, where ``y_pred`` is the ``argmax`` of the same pass.
+    PR-AUC is a ranking metric and needs the continuous positive-class score; the
+    hard-label metrics (precision, recall, accuracy) need the model's decision.
+    Keeping the two inputs separate (rather than re-thresholding the score here)
+    means the hard-label metrics reflect the model's own decision rule and stay
+    consistent with ``y_score`` even for the stochastic BDL model, where
+    ``y_pred`` is the ``argmax`` of the same pass.
 
     Args:
         y_true: Ground-truth binary labels.
@@ -689,12 +697,15 @@ def _binary_metrics(
         y_pred: The model's predicted hard labels.
 
     Returns:
-        A dict with ``pr_auc``, ``precision`` and the supporting ``n_samples``.
+        A dict with ``pr_auc``, ``precision``, ``recall``, ``accuracy`` and the
+        supporting ``n_samples``.
 
     """
     return {
         "pr_auc": float(average_precision_score(y_true, y_score)),
         "precision": float(precision_score(y_true, y_pred, zero_division=0)),
+        "recall": float(recall_score(y_true, y_pred, zero_division=0)),
+        "accuracy": float(accuracy_score(y_true, y_pred)),
         "n_samples": int(len(y_true)),
     }
 
@@ -793,7 +804,15 @@ def _masked_metrics(
         "n_rejected": int((~keep_mask).sum()),
     }
     if not keep_mask.any():
-        result.update({"pr_auc": None, "precision": None, "n_samples": 0})
+        result.update(
+            {
+                "pr_auc": None,
+                "precision": None,
+                "recall": None,
+                "accuracy": None,
+                "n_samples": 0,
+            }
+        )
         return result
     result.update(
         _binary_metrics(y_true[keep_mask], y_score[keep_mask], y_pred[keep_mask])
@@ -845,6 +864,62 @@ def evaluate_bdl_on_test(
     reject_mask["reference_bayes_error"] = reference_bayes_error
 
     return no_mask, reject_mask
+
+
+def evaluate_bdl_reject_sweep(
+    model: Pipeline,
+    x_test: pdDataFrame,
+    y_test: np.ndarray,
+    reference_bayes_error: float,
+    multipliers: Sequence[float],
+) -> tuple[dict[str, float], list[dict[str, float | None]]]:
+    """Evaluate the BDL reject mask at several thresholds in a single MC pass.
+
+    Like ``evaluate_bdl_on_test``, but sweeps a set of rejection thresholds
+    instead of one. The test set is inferred *once* (one MC-dropout pass), then
+    each ``multiplier * reference_bayes_error`` is applied as the threshold, so
+    every operating point is scored from the same predictive distribution rather
+    than re-running inference per multiplier. A multiplier of ``1.0`` reproduces
+    ``evaluate_bdl_on_test``'s reject-mask result.
+
+    Args:
+        model: The BDL pipeline fitted on the full training set (its final step
+            is an ``MCDropoutClassifier``).
+        x_test: The held-out test features (same column layout as training X).
+        y_test: The held-out test labels.
+        reference_bayes_error: The base reference scalar from
+            ``bayes_error_reference``; each multiplier scales it.
+        multipliers: The threshold multipliers to evaluate.
+
+    Returns:
+        ``(no_mask_metrics, reject_masks)`` where ``reject_masks`` is one masked
+        metrics dict per multiplier (in the given order). Each dict carries
+        ``multiplier``, the applied ``reference_bayes_error`` (= multiplier *
+        base) and the ``base_reference_bayes_error`` alongside ``coverage`` and
+        ``n_rejected``.
+
+    """
+    classifier = model[-1]
+    x_pre = model[:-1].transform(x_test)
+    metrics = classifier.uncertainty_metrics(x_pre)
+    proba = metrics["mean_proba"]
+    y_score = proba[:, 1]
+    y_pred = classifier.classes_[np.argmax(proba, axis=1)]
+    bayes_error = metrics["bayes_error"]
+
+    no_mask = _binary_metrics(y_test, y_score, y_pred)
+
+    reject_masks: list[dict[str, float | None]] = []
+    for multiplier in multipliers:
+        threshold = reference_bayes_error * multiplier
+        keep_mask = bayes_error <= threshold
+        entry = _masked_metrics(y_test, y_score, y_pred, keep_mask)
+        entry["multiplier"] = float(multiplier)
+        entry["reference_bayes_error"] = float(threshold)
+        entry["base_reference_bayes_error"] = float(reference_bayes_error)
+        reject_masks.append(entry)
+
+    return no_mask, reject_masks
 
 
 def compare_models_on_test(  # noqa: PLR0913

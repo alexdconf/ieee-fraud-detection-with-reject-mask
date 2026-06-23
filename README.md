@@ -18,8 +18,8 @@ Three model builders in `src/utils/pipeline_tools.py`, each returning an sklearn
   (`MCDropoutClassifier`) whose predictive uncertainty feeds a reject mask.
   Exposes `uncertainty_metrics(X)` (predictive entropy, BALD, Bayes error, etc.).
 
-Current best: BDL PR-AUC ≈ 0.453 (transactions-only). `main.py` runs the XGBoost
-and BDL pipelines (MLP block commented out).
+Latest transactions-only run: BDL PR-AUC ≈ 0.456, XGBoost ≈ 0.530 (no reject
+mask). `main.py` runs the XGBoost and BDL pipelines (MLP block commented out).
 
 # Pipeline & evaluation
 
@@ -30,12 +30,34 @@ Each model runs three stages (see `notes/reject_mask_evaluation.md`):
 2. **Full-data refit** — `fit_full_model` refits the best params on all training
    data and saves the deployable `best_model.joblib`.
 3. **Test step** — `compare_models_on_test` scores a chronologically held-out 20%
-   test set and writes `test_comparison.json` with **PR-AUC + precision** for
-   XGBoost, BDL (no reject mask), and BDL (with reject mask).
+   test set and writes `test_comparison.json` with **PR-AUC, precision, recall,
+   and accuracy** for XGBoost, BDL (no reject mask), and BDL (with reject mask).
 
-The **reject mask** (first cut) computes a Bayes Error reference over all of
-training and rejects any test datum whose Bayes Error exceeds it; metrics are
-reported over the retained subset alongside `coverage`.
+The **reject mask** computes a Bayes Error reference from a reference set and
+rejects any test datum whose Bayes Error exceeds it; masked metrics are reported
+over the retained subset alongside `coverage` and `n_rejected`. By default the
+reference is `trouble_reference(bdl_model, x)` — the training rows the model is
+most uncertain about (top 5% by Bayes Error) — so the mask only rejects test data
+weirder than cases the model already struggles with.
+
+# Re-evaluating saved models
+
+`scripts/compare_saved_models.py` re-runs the test-step comparison from saved
+`best_model.joblib` artifacts — no retraining. It loads the XGBoost and BDL
+pipelines and the held-out test set from a run directory, rebuilds the
+reject-mask reference, and writes a fresh `test_comparison.json` (under
+`<run>/recompare/`).
+
+```
+uv run python scripts/compare_saved_models.py [REPORT_DIR] --reference {trouble,all,none}
+```
+
+- `trouble` (default) — reference = `trouble_reference` subset (`--metric`,
+  `--quantile` tune which rows it selects).
+- `all` — reference = full training set, swept over a set of Bayes-Error
+  threshold multipliers, with one labelled `bdl_reject_mask_x{m}` result each.
+- `none` — no reject mask; just XGBoost and BDL test metrics (fast, skips the
+  training-set reference reconstruction).
 
 # Project notes / handoff
 
@@ -47,3 +69,5 @@ Design decisions, debugging findings, and open work live in `notes/`:
   and the reject-mask uncertainty metrics.
 - `notes/reject_mask_evaluation.md` — the held-out test split, full-data refit,
   and the implemented Bayes Error reject-mask evaluation.
+- `notes/categorical_and_numeric_encoding.md` — categorical/numeric feature
+  encoding choices for the pipelines.

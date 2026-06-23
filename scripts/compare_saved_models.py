@@ -17,7 +17,8 @@ Examples:
     uv run python scripts/compare_saved_models.py reports/20260621-132004_transactions_only \\
         --metric bald --quantile 0.99
 
-    # Compare against the old "all of training" reference instead:
+    # Full-training reference, swept over Bayes-Error multipliers
+    # (1, 1.25, 1.67, 2, 2.15) -- one labelled reject-mask result each:
     uv run python scripts/compare_saved_models.py --reference all
 
     # No reject mask -- just XGBoost and BDL test metrics (fast, no CSV reload):
@@ -47,11 +48,17 @@ from utils.data_handlers import (  # noqa: E402
     load_csv_data,
 )
 from utils.pipeline_tools import (  # noqa: E402
+    bayes_error_reference,
     compare_models_on_test,
+    evaluate_bdl_reject_sweep,
     evaluate_on_test,
 )
 
 _COMPARISON_FILENAME = "test_comparison.json"
+
+# Reject-mask thresholds swept for the full-training-set reference: each is a
+# multiplier of the reduced reference Bayes Error. 1.0 is the plain reference.
+_ALL_REFERENCE_MULTIPLIERS = (1.0, 2.0, 3.0, 5.0, 10.0)
 
 
 def _latest_report_dir() -> Path:
@@ -169,25 +176,44 @@ def main() -> None:
             x_reference = trouble_reference(
                 bdl_model, x_train, metric=args.metric, quantile=args.quantile
             )
-            ref_desc = (
-                f"trouble_reference(metric={args.metric}, quantile={args.quantile}) "
-                f"-> {len(x_reference)}/{len(x_train)} rows"
+            sys.stdout.write(
+                f"Reference:   trouble_reference(metric={args.metric}, "
+                f"quantile={args.quantile}) -> {len(x_reference)}/{len(x_train)} "
+                f"rows\n"
+            )
+            sys.stdout.write(f"Reduction:   {args.reduction}\n\n")
+            results = compare_models_on_test(
+                xgb_model,
+                bdl_model,
+                x_reference,
+                x_test,
+                y_test,
+                out_dir,
+                reduction=args.reduction,
             )
         else:
-            x_reference = x_train
-            ref_desc = f"all training -> {len(x_reference)} rows"
-
-        sys.stdout.write(f"Reference:   {ref_desc}\n")
-        sys.stdout.write(f"Reduction:   {args.reduction}\n\n")
-        results = compare_models_on_test(
-            xgb_model,
-            bdl_model,
-            x_reference,
-            x_test,
-            y_test,
-            out_dir,
-            reduction=args.reduction,
-        )
+            # all: sweep the reject threshold over multipliers of the reduced
+            # full-training-set reference Bayes Error, one masked result each.
+            reference = bayes_error_reference(
+                bdl_model, x_train, reduction=args.reduction
+            )
+            sys.stdout.write(
+                f"Reference:   all training -> {len(x_train)} rows; base Bayes "
+                f"Error ({args.reduction}) = {reference:.6f}\n"
+            )
+            sys.stdout.write(f"Multipliers: {_ALL_REFERENCE_MULTIPLIERS}\n\n")
+            no_mask, reject_masks = evaluate_bdl_reject_sweep(
+                bdl_model, x_test, y_test, reference, _ALL_REFERENCE_MULTIPLIERS
+            )
+            results = {
+                "xgboost": evaluate_on_test(xgb_model, x_test, y_test),
+                "bdl_no_reject_mask": no_mask,
+            }
+            for entry in reject_masks:
+                results[f"bdl_reject_mask_x{entry['multiplier']}"] = entry
+            out_dir.mkdir(parents=True, exist_ok=True)
+            with (out_dir / _COMPARISON_FILENAME).open("w") as f:
+                json.dump(results, f, indent=4)
 
     sys.stdout.write(json.dumps(results, indent=2) + "\n")
     sys.stdout.write(f"\nWrote {out_dir / _COMPARISON_FILENAME}\n")

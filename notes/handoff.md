@@ -1,6 +1,6 @@
 # Handoff / project status
 
-Pick-up doc for a fresh agent. Last updated 2026-06-21.
+Pick-up doc for a fresh agent. Last updated 2026-06-23.
 
 ## Goal
 
@@ -70,17 +70,16 @@ sweet spot on this machine (~80% RAM, GPU fine).
 
 ## Latest result
 
-**BDL PR-AUC ≈ 0.453** (full transactions-only run) after fixing the timestamp
-leak and using StandardScaler. Up from ≈0.037 (base rate) when the leak was
-present. PR-AUC = base rate is the signature of "no ranking signal."
+**BDL PR-AUC ≈ 0.456, XGBoost ≈ 0.530** (latest full transactions-only run,
+`reports/20260621-132004_transactions_only`, no reject mask). BDL is up from
+≈0.037 (base rate) before the timestamp leak was fixed — PR-AUC = base rate is the
+signature of "no ranking signal."
 
-**Preprocessing #1+#2 now implemented** (TargetEncoder + QuantileTransformer in
-both NN pipelines). Subset head-to-head (BDL, 80k rows, time-ordered 80/20) shows
-**+0.025 to +0.038 PR-AUC** over the old OrdinalEncoder+StandardScaler at matched
-params, with tighter bounded magnitudes (max |x| 339→65) and no NaNs. The
-full-data run vs the 0.453 baseline is **still pending** (the user runs the ~3h
-jobs) — see `notes/categorical_and_numeric_encoding.md` for the table and the
-exact command (`scripts/validate_preprocessing.py`).
+**Preprocessing #1+#2 are implemented** (cross-fitted TargetEncoder +
+QuantileTransformer in both NN pipelines), replacing OrdinalEncoder+StandardScaler:
+tighter bounded magnitudes (max |x| 339→65) and no NaNs. Subset head-to-head (BDL,
+80k rows, time-ordered 80/20) showed **+0.025 to +0.038 PR-AUC** at matched params
+— see `notes/categorical_and_numeric_encoding.md` for the table.
 
 ## What was settled (see the other notes files)
 
@@ -111,55 +110,53 @@ Ranked, for the NN pipelines (`bdl_reference`/`mlp_reference`; leave XGB as-is):
 4. **Dimensionality (later):** `VarianceThreshold` to drop near-constant cols;
    PCA on the correlated V-column blocks.
 
-#1 and #2 are implemented and pass a subset head-to-head (see Latest result and
-`notes/categorical_and_numeric_encoding.md`). Outstanding: the full-data run vs
-0.453 (user-run), then #3.
+#1 and #2 are implemented and reflected in the latest full run (see Latest result
+and `notes/categorical_and_numeric_encoding.md`). Outstanding: #3 (missingness
+indicators), then #4.
 
-## Reject mask & test evaluation — FIRST CUT DONE
+## Reject mask & test evaluation — DONE
 
-Implemented 2026-06-21; full detail in `notes/reject_mask_evaluation.md`.
+Full detail in `notes/reject_mask_evaluation.md`.
 
 - **Held-out test set:** `holdout_test_split` reserves the most recent 20% of
   `train_transaction.csv` (chronological); saved to `report_dir/holdout_test.parquet`.
 - **Test comparison:** `compare_models_on_test` writes
-  `report_dir/test_comparison.json` with **PR-AUC + precision** for `xgboost`,
-  `bdl_no_reject_mask`, and `bdl_reject_mask`.
-- **Reject rule (first cut):** reference = Bayes Error over **all of training**,
-  reduced by `mean` (`reduction` param; `max` saturates because binary Bayes
-  Error ≤ 0.5). A test datum is rejected iff its `bayes_error > reference`. One MC
-  pass over the test set feeds both masked and unmasked metrics.
+  `report_dir/test_comparison.json` with **PR-AUC, precision, recall, and
+  accuracy** for `xgboost`, `bdl_no_reject_mask`, and `bdl_reject_mask`. All
+  metrics funnel through `_binary_metrics` (single source of truth); masked
+  results also carry `coverage` and `n_rejected`.
+- **Reject rule:** reference = Bayes Error over a *reference set*, reduced by
+  `mean` (`reduction` param; `max` saturates because binary Bayes Error ≤ 0.5). A
+  test datum is rejected iff its `bayes_error > reference`. One MC pass over the
+  test set feeds both masked and unmasked metrics.
+- **Reference set = `trouble_reference(bdl_model, x)`** (defined in `src/main.py`):
+  the training rows the model is most uncertain about — top 5% by Bayes Error (the
+  metric the mask thresholds; pass `metric="bald"` for the epistemic flavour,
+  `quantile=` for the cut). This is the "all-weird" reference from
+  `bdl_imbalance_calibration.md` §5 — the mask only rejects test data weirder than
+  cases the model already struggles with. (Replaces the deleted
+  `reference_sets.py`/`subset_finder.py` `ReferenceSpec` framework, removed as
+  over-built for current needs.)
+
+### Re-evaluating saved models — `scripts/compare_saved_models.py`
+
+Re-runs the test-step comparison from saved `best_model.joblib` artifacts, **no
+retraining**. Loads the XGB+BDL pipelines and `holdout_test.parquet` from a run
+dir, rebuilds the reference, and writes a fresh `test_comparison.json` under
+`<run>/recompare/`. The training features for the reference are not persisted, so
+they are reconstructed deterministically via the same `holdout_test_split`.
+`--reference`:
+- `trouble` (default) — `trouble_reference` subset (`--metric`, `--quantile`).
+- `all` — full training set, swept over Bayes-Error threshold multipliers
+  (`_ALL_REFERENCE_MULTIPLIERS`), one labelled `bdl_reject_mask_x{m}` result each
+  (via `evaluate_bdl_reject_sweep` — single MC pass, applies every threshold).
+- `none` — no mask; XGB+BDL test metrics only (fast, skips the reference).
 
 Still open:
-- Reference currently defaults to all of training (lenient by design). It is now a
-  declared `ReferenceSpec` — swap in a subset of interest when ready (see below).
 - **BALD** (epistemic/OOD signal, already in `uncertainty_metrics`) is the next
   metric to add to the *reject mask itself* — Bayes Error collapses to the mean and
-  carries no disagreement signal (see `bdl_imbalance_calibration.md` §5). (The new
-  reference selectors/finder already default to BALD.)
+  carries no disagreement signal (see `bdl_imbalance_calibration.md` §5).
 - Optional calibration check (reliability curve + Brier) on a fold.
-
-## Reference sets & subset finder — SCAFFOLDED
-
-Implemented 2026-06-21; full detail in `notes/reference_sets_and_subset_finder.md`.
-Two additions on top of the reject-mask workflow:
-
-1. **Specify & capture `x_reference`** (`src/utils/reference_sets.py`, functional):
-   the reference set is a serializable `ReferenceSpec` (a registered `selector` +
-   `params`). `resolve_reference` builds the `x_reference` matrix (training/test
-   layout) + provenance; `save_reference_report` writes `reference_spec.json` and
-   `compare_models_on_test(..., reference_provenance=...)` embeds it in
-   `test_comparison.json`. Selectors: `all` (default = first-cut behaviour),
-   `by_label`, `feature_threshold`, `uncertainty_quantile` (the "all-weird /
-   all-perfect" reference, needs the BDL model). `main.py` resolves the default
-   `all_training_reference()` (behaviour-identical to the old `x_reference = x`).
-2. **Find subsets of interest** (`src/utils/subset_finder.py`, scaffold):
-   `find_subsets_of_interest` enumerates strategies → proposes specs → resolves →
-   diagnoses → ranks → writes `subsets_of_interest.json`. Plumbing is real; the
-   `_score_candidate` interestingness heuristic and richer (clustering/data-driven)
-   proposers are **TODO** — see the note. A commented call sits in `main.py` (off
-   by default — model-driven strategies run MC passes over `train_df`).
-
-   Promote a candidate by copying its `spec` into `main.py`'s `reference_spec`.
 
 ## Gotchas
 
