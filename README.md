@@ -86,3 +86,5 @@ Design decisions, debugging findings, and open work live in `notes/`:
   and the implemented Bayes Error reject-mask evaluation.
 - `notes/categorical_and_numeric_encoding.md` — categorical/numeric feature
   encoding choices for the pipelines.
+- `notes/pandas_and_polars.md` — why both libraries are here: polars for data
+  handling, pandas only at the sklearn/XGBoost boundary.
