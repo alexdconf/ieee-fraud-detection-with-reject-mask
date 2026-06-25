@@ -32,7 +32,9 @@ Each model runs three stages (see `notes/reject_mask_evaluation.md`):
 3. **Test step** — `compare_models_on_test` scores a chronologically held-out 20%
    test set and writes `test_comparison.json` for XGBoost, BDL (no reject mask),
    and BDL (with reject mask). Each carries **PR-AUC, precision, recall, accuracy,
-   plus macro and per-class precision/recall**.
+   plus macro and per-class precision/recall**. Per-class keys are the `isFraud`
+   labels — `"1"` = fraud, `"0"` = legit — and the flat `precision`/`recall` are
+   the fraud (positive) class.
 
 The **reject mask** computes a Bayes Error reference from a reference set and
 rejects any test datum whose Bayes Error exceeds it; masked metrics are reported
@@ -40,6 +42,18 @@ over the retained subset alongside `coverage` and `n_rejected`. By default the
 reference is `trouble_reference(bdl_model, x)` — the training rows the model is
 most uncertain about (top 5% by Bayes Error) — so the mask only rejects test data
 weirder than cases the model already struggles with.
+
+## The held-out test set (`holdout_test.parquet`)
+
+Each run writes `holdout_test.parquet` to its report directory — the held-out test
+set itself. `holdout_test_split` sorts `train_transaction.csv` by `TransactionDT`
+and reserves the **most recent 20%** of rows as the test set (a deterministic,
+time-based cut — not a random or stratified sample, so its fraud rate is whatever
+the latest transactions happen to have). Those rows — the full feature columns
+plus the `isFraud` label — are saved to the parquet. Only this test slice is
+persisted; the training 80% is reconstructed on demand from the CSV, which is how
+`compare_saved_models.py` rebuilds the reject-mask reference while loading the test
+set straight from the parquet.
 
 # Re-evaluating saved models
 
