@@ -1,0 +1,14 @@
+{
+    "best_score": 0.46897686342350137,
+    "best_params": {
+        "classifier__activation": "tanh",
+        "classifier__alpha": 1.2087541473056965e-06,
+        "classifier__dropout": 0.39097295564859824,
+        "classifier__hidden_layer_sizes": [
+            100,
+            100
+        ],
+        "classifier__lr": 0.00022948683681130568,
+        "classifier__max_iter": 391
+    }
+}
