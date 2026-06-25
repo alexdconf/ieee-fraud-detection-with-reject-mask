@@ -121,10 +121,12 @@ Full detail in `notes/reject_mask_evaluation.md`.
 - **Held-out test set:** `holdout_test_split` reserves the most recent 20% of
   `train_transaction.csv` (chronological); saved to `report_dir/holdout_test.parquet`.
 - **Test comparison:** `compare_models_on_test` writes
-  `report_dir/test_comparison.json` with **PR-AUC, precision, recall, and
-  accuracy** for `xgboost`, `bdl_no_reject_mask`, and `bdl_reject_mask`. All
-  metrics funnel through `_binary_metrics` (single source of truth); masked
-  results also carry `coverage` and `n_rejected`.
+  `report_dir/test_comparison.json` for `xgboost`, `bdl_no_reject_mask`, and
+  `bdl_reject_mask`. Each carries **PR-AUC, precision, recall, accuracy, plus
+  `precision_macro`/`recall_macro` and `precision_per_class`/`recall_per_class`**
+  (per-class accuracy is omitted — it equals per-class recall). All metrics funnel
+  through `_binary_metrics` (single source of truth); masked results also carry
+  `coverage` and `n_rejected`.
 - **Reject rule:** reference = Bayes Error over a *reference set*, reduced by
   `mean` (`reduction` param; `max` saturates because binary Bayes Error ≤ 0.5). A
   test datum is rejected iff its `bayes_error > reference`. One MC pass over the

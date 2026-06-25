@@ -1,6 +1,7 @@
 # Reject mask & held-out test evaluation
 
-Implemented 2026-06-21. Covers the held-out test split, the full-data refit, and
+Implemented 2026-06-21; reference + metrics updated 2026-06-25. Covers the
+held-out test split, the full-data refit, and
 the test-set comparison step that scores XGBoost vs BDL (with and without the
 reject mask). The *conceptual* discussion of the Bayes Error metric and its
 caveats lives in `notes/bdl_imbalance_calibration.md` §5 — this note documents
@@ -51,32 +52,36 @@ configurations:
 
 ### Metrics
 
-`_binary_metrics` reports two metrics, deliberately from different inputs:
+`_binary_metrics` reports, from two deliberately different inputs:
 
 - **PR-AUC** (`average_precision_score`) from the continuous positive-class
   score. A ranking metric — it *needs* probabilities, not hard labels.
-- **Precision** (`precision_score`) from the model's own hard decision. The hard
-  label is `argmax` of the **same** probabilities used for PR-AUC — identical to
-  `.predict()`, but computed from one set of scores. This matters for the
+- **Hard-label metrics** from the model's own decision: `precision`, `recall`,
+  `accuracy` (aggregate), `precision_macro`/`recall_macro` (unweighted mean across
+  classes), and `precision_per_class`/`recall_per_class` (keyed by label). The
+  hard label is `argmax` of the **same** probabilities used for PR-AUC — identical
+  to `.predict()`, but computed from one set of scores. This matters for the
   stochastic BDL model: a second `.predict()` call would be a *different*
   MC-dropout pass, desyncing the label from the score. No hand-rolled 0.5
   threshold (that would just re-implement `.predict()` and smuggle in a magic
   number; a non-default operating point, if ever wanted, should be tuned on
-  validation, not the test set).
+  validation, not the test set). Per-class accuracy is intentionally omitted — the
+  share of a class's samples predicted correctly equals that class's recall.
 
 The masked config additionally reports `coverage` (fraction kept), `n_rejected`,
-and the `reference_bayes_error` applied.
+and the `reference_bayes_error` applied. When every sample is rejected the metrics
+come back `null` instead of raising.
 
 ## The reject mask (Bayes Error vs training reference)
 
 The intended general workflow (see `bdl_imbalance_calibration.md` §5): infer a
 reference set, get reject-mask metrics; infer the test set (N MC passes/datum),
-get the same metrics; compare per-datum to decide reject/keep. **First cut, as
-specified:** the reference set is *all of training*, and the only signal compared
-is **Bayes Error**.
+get the same metrics; compare per-datum to decide reject/keep. The signal compared
+is **Bayes Error**. The reference set started as *all of training* and is now
+`trouble_reference` (see below).
 
-- `bayes_error_reference(model, x_reference, reduction="mean")` infers the full
-  training set through the fitted BDL pipeline (one `uncertainty_metrics` MC run)
+- `bayes_error_reference(model, x_reference, reduction="mean")` infers the
+  reference set through the fitted BDL pipeline (one `uncertainty_metrics` MC run)
   and reduces its per-sample Bayes Errors to a single scalar.
 - `evaluate_bdl_on_test(model, x_test, y_test, reference)` runs **one** MC-dropout
   pass over the test set (`uncertainty_metrics`), so the no-mask metrics, the
@@ -84,10 +89,15 @@ is **Bayes Error**.
   distribution and the test set is not inferred twice. **Reject rule: a test
   datum is rejected iff its `bayes_error > reference`** (kept iff `<=`).
 - `_masked_metrics` scores the kept subset and guards the empty case (every
-  sample rejected → PR-AUC / precision returned as `null` instead of raising).
+  sample rejected → all metrics returned as `null` instead of raising).
 
-In `main.py` the reference `x_reference` is exactly the BDL training matrix `x`,
-i.e. all of `train_df`.
+In `main.py` the reference is `trouble_reference(bdl_model, x)`: the training rows
+the model is most uncertain about (top 5% by Bayes Error — the metric the mask
+thresholds; `metric="bald"` selects the epistemic flavour, `quantile=` the cut).
+The mask then only rejects test data weirder than cases the model already
+struggles with. (Earlier this was the whole training matrix `x`; the
+`reference_sets.py`/`subset_finder.py` `ReferenceSpec` framework that briefly
+generalised it was removed as over-built.)
 
 ### Why `reduction="mean"` (not max)
 
@@ -101,14 +111,23 @@ target coverage is wanted. (Synthetic smoke check: mean reference → ~47% cover
 ### Known caveats / deliberate choices
 
 - **Reference is on data the model trained on**, so its Bayes Error is
-  optimistically low and the threshold is correspondingly lenient. This is exactly
-  the "first reference = all of training" spec; swapping to a held-off reference
-  is just a different `x_reference` argument.
+  optimistically low. `trouble_reference` deliberately picks the most-uncertain
+  training rows, pushing the threshold high (lenient); swapping to a held-off or
+  otherwise different reference is just a different `x_reference` argument.
 - **Bayes Error carries no epistemic signal.** Linearity of expectation collapses
   it to `1 − p̄` (the mean-probability flavor), and it is the metric *distorted*
   by the balanced-weighting inflation — see `bdl_imbalance_calibration.md` §5.
   Starting with Bayes Error is intentional; **BALD** is the disagreement/OOD
   alternative already exposed by `uncertainty_metrics` for the next iteration.
+
+## Re-evaluation & threshold sweep (no retraining)
+
+`scripts/compare_saved_models.py` re-runs this comparison from saved
+`best_model.joblib` artifacts — `--reference trouble|all|none`. With
+`--reference all` it sweeps the reject threshold over multipliers of the reference
+scalar via `evaluate_bdl_reject_sweep` (one MC pass over the test set, every
+threshold applied), writing one labelled `bdl_reject_mask_x{m}` result each;
+`--reference none` skips the mask entirely. See `notes/handoff.md` for usage.
 
 ## Status of `main.py`
 

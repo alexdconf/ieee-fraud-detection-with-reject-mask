@@ -696,16 +696,38 @@ def _binary_metrics(
         y_score: Predicted probability of the positive (fraud) class.
         y_pred: The model's predicted hard labels.
 
+    Precision and recall are surfaced both altogether and per class. The flat
+    ``precision``/``recall`` are the positive-class (fraud) figures and
+    ``accuracy`` is overall; ``precision_macro``/``recall_macro`` are the
+    unweighted means across classes, and ``precision_per_class``/
+    ``recall_per_class`` map each class label to its own figure. (Per-class
+    accuracy is omitted: the share of a class's samples predicted correctly is
+    identical to that class's recall, so read ``recall_per_class`` for it.)
+
     Returns:
-        A dict with ``pr_auc``, ``precision``, ``recall``, ``accuracy`` and the
-        supporting ``n_samples``.
+        A dict with ``pr_auc``, ``precision``, ``recall``, ``accuracy``,
+        ``precision_macro``, ``recall_macro``, ``precision_per_class``,
+        ``recall_per_class`` and the supporting ``n_samples``.
 
     """
+    labels = np.unique(y_true)
+    precision_each = precision_score(
+        y_true, y_pred, labels=labels, average=None, zero_division=0
+    )
+    recall_each = recall_score(
+        y_true, y_pred, labels=labels, average=None, zero_division=0
+    )
+    precision_per_class = {str(c): float(p) for c, p in zip(labels, precision_each)}
+    recall_per_class = {str(c): float(r) for c, r in zip(labels, recall_each)}
     return {
         "pr_auc": float(average_precision_score(y_true, y_score)),
         "precision": float(precision_score(y_true, y_pred, zero_division=0)),
         "recall": float(recall_score(y_true, y_pred, zero_division=0)),
         "accuracy": float(accuracy_score(y_true, y_pred)),
+        "precision_macro": float(np.mean(precision_each)),
+        "recall_macro": float(np.mean(recall_each)),
+        "precision_per_class": precision_per_class,
+        "recall_per_class": recall_per_class,
         "n_samples": int(len(y_true)),
     }
 
@@ -810,6 +832,10 @@ def _masked_metrics(
                 "precision": None,
                 "recall": None,
                 "accuracy": None,
+                "precision_macro": None,
+                "recall_macro": None,
+                "precision_per_class": None,
+                "recall_per_class": None,
                 "n_samples": 0,
             }
         )

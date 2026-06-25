@@ -30,8 +30,9 @@ Each model runs three stages (see `notes/reject_mask_evaluation.md`):
 2. **Full-data refit** — `fit_full_model` refits the best params on all training
    data and saves the deployable `best_model.joblib`.
 3. **Test step** — `compare_models_on_test` scores a chronologically held-out 20%
-   test set and writes `test_comparison.json` with **PR-AUC, precision, recall,
-   and accuracy** for XGBoost, BDL (no reject mask), and BDL (with reject mask).
+   test set and writes `test_comparison.json` for XGBoost, BDL (no reject mask),
+   and BDL (with reject mask). Each carries **PR-AUC, precision, recall, accuracy,
+   plus macro and per-class precision/recall**.
 
 The **reject mask** computes a Bayes Error reference from a reference set and
 rejects any test datum whose Bayes Error exceeds it; masked metrics are reported
