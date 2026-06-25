@@ -169,9 +169,13 @@ def features_and_target(
 ) -> tuple[pdDataFrame, np.ndarray]:
     """Split a DataFrame into features (X) and target (y), sorted by timestamp.
 
-    Produces the same chronologically-sorted, target-excluded feature matrix that
+    Produces the same chronologically-sorted feature matrix that
     ``time_series_split`` builds, so a pipeline fitted on the training X can be
-    evaluated on a held-out test set with an identical column layout.
+    evaluated on a held-out test set with an identical column layout. Both the
+    ``target`` and the ``timestamp`` are excluded from X: the timestamp is only a
+    sort/split key, never a feature (leaving it in leaked into XGBoost via its
+    ``remainder="passthrough"`` preprocessor, and the chronological split makes
+    test timestamps out-of-range anyway).
 
     Args:
         df: The Polars DataFrame.
@@ -183,7 +187,7 @@ def features_and_target(
 
     """
     df_sorted = df.sort(timestamp)
-    x = df_sorted.select(pl.all().exclude(target)).to_pandas()
+    x = df_sorted.select(pl.all().exclude(target, timestamp)).to_pandas()
     y = df_sorted.select(target).to_pandas().to_numpy().ravel()
     return x, y
 

@@ -35,10 +35,12 @@ sees `train_df`; the test set is never touched during training. The test rows ar
 persisted to `report_dir/holdout_test.parquet`.
 
 `features_and_target(df, target, timestamp)` builds the test `(X, y)` with the
-**same column layout** `time_series_split` produces (sorted, target excluded,
-`TransactionDT` kept as a column — BDL drops it via `remainder="drop"`, XGB passes
-it through). `time_series_split` now delegates to this helper so the two cannot
-drift apart.
+**same column layout** `time_series_split` produces (sorted; both the target and
+`TransactionDT` excluded from X — the timestamp is only a sort/split key, never a
+feature). `time_series_split` now delegates to this helper so the two cannot drift
+apart. (Previously the timestamp was left in X, which BDL dropped via
+`remainder="drop"` but XGB leaked in via `remainder="passthrough"`; dropping it at
+the source fixes both.)
 
 ## Test comparison step
 
