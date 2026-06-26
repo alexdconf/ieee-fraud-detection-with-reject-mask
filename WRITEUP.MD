@@ -18,10 +18,13 @@ I first built the training pipeline, then I built an evaluation script. The `mai
 
 You can find any generated reports and information in the `reports/` directory.
 
-# Results
+# Evaluation and Results
+Refer to the data files here `reports/20260625-155136_transactions_only/recompare` (trouble vs all).
+
+## trouble
 
 
-# Conclusion
+## all
 
 
 # Discussion
@@ -30,3 +33,4 @@ You can find any generated reports and information in the `reports/` directory.
 # Improvements and Next Steps
 Try more data sets
 Better performing models here, to see if there's any meaningful change in results
+More reject metrics and methods
