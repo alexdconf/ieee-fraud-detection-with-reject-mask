@@ -19,3 +19,14 @@ I first built the training pipeline, then I built an evaluation script. The `mai
 You can find any generated reports and information in the `reports/` directory.
 
 # Results
+
+
+# Conclusion
+
+
+# Discussion
+
+
+# Improvements and Next Steps
+Try more data sets
+Better performing models here, to see if there's any meaningful change in results
