@@ -196,14 +196,27 @@ real test is whether `bald`/`epistemic_var` beat `bayes_error`/`predictive_entro
 and `random`.** If they don't, the MC-dropout machinery isn't earning its cost here.
 `--bootstrap N` resamples the test set for AURC/risk error bars (the MC pass is done
 once; only the rows are resampled), so "beats random" can be judged against noise.
+The resample `idx` is shared across rules each iteration, so the stored raw draws
+(`aurc_boot_samples`) are **paired** — `scripts/analyze_risk_coverage.py` uses them
+for a paired bootstrap AURC test (`AURC_baseline(b) − AURC_rule(b)` per draw), which
+cancels the shared row-sampling noise. Without raw draws it falls back to an
+independent-Gaussian z-test on `aurc_boot_mean/std`, which is *conservative* (the true
+paired SE is smaller, so a significant result there is significant a fortiori).
 
-**Preliminary read** (`reports/20260625-155136_transactions_only/recompare/risk_coverage.json`,
-**no bootstrap yet** — treat as suggestive, not significant): on balanced-error AURC,
-`bald` (0.0604) just edges `random` (0.0640); the confidence rules `bayes_error` /
-`predictive_entropy` (0.0802) are *worse than random* — confidence-based abstention
-preferentially discards boundary frauds on this imbalance. Rerun with `--bootstrap`
-before drawing any firm conclusion. Figure:
-`supplementary_material/risk_coverage.png`.
+**Result** (`reports/20260625-155136_transactions_only/recompare/risk_coverage.json`,
+bootstrapped). On balanced-error AURC: `bald` 0.0605 beats `random` 0.0641
+(conservative z-test p≈0.012 — significant; the JSON predates `aurc_boot_samples`, so
+rerun the sweep to get the stronger *paired* test); the confidence rules
+`bayes_error`/`predictive_entropy` 0.0805 are **decisively worse than random**
+(z≈16). The mechanism is a recall/precision tradeoff that the confidence rules fall
+into and `bald` largely escapes: as coverage drops to 0.80, `bayes_error` recall
+(fraud catch rate) collapses 0.37→0.00 while precision →1.0 — it buys precision by
+discarding essentially every fraud (uncertain ⇒ boundary frauds), so balanced error
+blows up to 0.5. `bald` instead lifts precision 0.58→0.87 with recall roughly flat
+(0.37→0.40, dipping only at the most aggressive coverage), so it is a coverage/precision
+exchange, not a precision/recall one. Balanced error stays floored near 0.30 even for
+`bald` because fraud recall never climbs past ~0.40. Figure:
+`supplementary_material/risk_coverage.png`; tests via `scripts/analyze_risk_coverage.py`.
 
 ## Status of `main.py`
 

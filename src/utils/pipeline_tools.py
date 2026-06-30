@@ -1058,7 +1058,12 @@ def _risk_coverage_bootstrap(
     fixed; only the row sample varies), recomputing balanced error -- cheaply,
     skipping the descriptive PR-AUC/precision in the loop. Writes ``risk_lo`` /
     ``risk_hi`` (2.5/97.5 percentiles) per point and ``aurc_boot_mean`` /
-    ``aurc_boot_std`` per method.
+    ``aurc_boot_std`` per method, plus the raw per-resample AURC draws
+    (``aurc_boot_samples``). Every method shares the same resample ``idx`` at
+    iteration ``b``, so the draws are *paired* across methods (aligned by index):
+    a proper paired test of one rule against another is
+    ``samples_A[b] - samples_B[b]``, which cancels the shared row-sampling noise
+    and is far more powerful than treating the two AURCs as independent.
     """
     n = len(y_true)
     n_cov = len(coverages)
@@ -1089,6 +1094,11 @@ def _risk_coverage_bootstrap(
             point["risk_hi"] = float(hi[j])
         out["methods"][name]["aurc_boot_mean"] = float(np.nanmean(aurcs[name]))
         out["methods"][name]["aurc_boot_std"] = float(np.nanstd(aurcs[name]))
+        # Raw paired draws for downstream paired tests; non-finite -> null so the
+        # JSON stays standard and the consumer can drop those resamples.
+        out["methods"][name]["aurc_boot_samples"] = [
+            float(a) if np.isfinite(a) else None for a in aurcs[name]
+        ]
 
 
 def risk_coverage_sweep(  # noqa: PLR0913

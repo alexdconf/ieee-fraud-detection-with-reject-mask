@@ -192,15 +192,21 @@ scores `random`, `bayes_error`, `predictive_entropy`, `bald`, `epistemic_var`,
   now *evaluated* as a ranking signal, though not yet wired as the default reject-mask
   metric in `main.py`.
 
-**Preliminary** (`reports/20260625-155136_transactions_only/recompare/risk_coverage.json`,
-**no bootstrap — suggestive only**): `bald` AURC 0.0604 barely beats `random` 0.0640;
-confidence rules 0.0802 are *worse than random*. Rerun with `--bootstrap` for error
-bars before concluding. Figure: `supplementary_material/risk_coverage.png`. Full
-detail: `notes/reject_mask_evaluation.md` (last section).
+**Result** (`reports/20260625-155136_transactions_only/recompare/risk_coverage.json`,
+bootstrapped): `bald` AURC 0.0605 beats `random` 0.0641 (conservative z-test p≈0.012);
+confidence rules 0.0805 are decisively *worse than random* (z≈16). The confidence rules
+tank fraud recall (0.37→0.00 by 80% coverage) buying precision by discarding boundary
+frauds; `bald` lifts precision with recall ~flat — a coverage/precision exchange, not a
+precision/recall one. Test it with `scripts/analyze_risk_coverage.py` (paired bootstrap
+when raw draws are present, conservative z-test otherwise). Figure:
+`supplementary_material/risk_coverage.png`. Full detail:
+`notes/reject_mask_evaluation.md` (last section).
 
 Still open:
-- **Rerun the risk–coverage sweep with `--bootstrap`** to put error bars on AURC and
-  decide whether `bald`'s edge over `random` is real.
+- **Rerun the sweep to refresh `risk_coverage.json` with `aurc_boot_samples`** (the
+  current file predates that field) so `analyze_risk_coverage.py` can run the stronger
+  *paired* bootstrap test instead of the conservative z-test. The conservative test
+  already calls `bald` > `random` significant (p≈0.012); paired only strengthens it.
 - Wiring BALD as the reject mask's *default* signal in `main.py` (only if the sweep
   shows it helps — Bayes Error collapses to the mean and carries no disagreement
   signal; see `bdl_imbalance_calibration.md` §5).

@@ -146,8 +146,13 @@ uv run python scripts/compare_saved_models.py [REPORT_DIR] \
 - `risk_coverage` — the matched-coverage risk–coverage sweep over all six
   abstention rules (see *Risk–coverage evaluation* above); writes
   `risk_coverage.json` and prints the AURC league table. `--coverages` sets the
-  coverage grid, `--bootstrap N` the error-bar resamples. Plot it with
-  `scripts/plot_risk_coverage.py <run>/recompare/risk_coverage.json`.
+  coverage grid, `--bootstrap N` the error-bar resamples (which also persist the
+  raw paired AURC draws). Plot it with
+  `scripts/plot_risk_coverage.py <run>/recompare/risk_coverage.json`; test it with
+  `scripts/analyze_risk_coverage.py <run>/recompare/risk_coverage.json` — a
+  **paired bootstrap** AURC test of each rule vs a baseline (falling back to a
+  conservative independent z-test for JSONs without the raw draws), plus the
+  per-rule recall/precision-vs-coverage tables that expose any tradeoff.
 
 # Project notes / handoff
 
