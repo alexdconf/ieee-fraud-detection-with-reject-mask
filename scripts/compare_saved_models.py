@@ -23,6 +23,15 @@ Examples:
 
     # No reject mask -- just XGBoost and BDL test metrics (fast, no CSV reload):
     uv run python scripts/compare_saved_models.py --reference none
+
+    # Random-abstention baseline at 92.6% coverage (match a reject-mask run's
+    # coverage to compare like-for-like; no CSV reload):
+    uv run python scripts/compare_saved_models.py --reference random --quantile 0.926
+
+    # Risk--coverage curves for every abstention rule at matched coverage, with
+    # AURC and 200-resample bootstrap error bars (one MC pass, no CSV reload):
+    uv run python scripts/compare_saved_models.py --reference risk_coverage \\
+        --bootstrap 200
 """
 
 from __future__ import annotations
@@ -50,11 +59,14 @@ from utils.data_handlers import (  # noqa: E402
 from utils.pipeline_tools import (  # noqa: E402
     bayes_error_reference,
     compare_models_on_test,
+    evaluate_bdl_random_mask,
     evaluate_bdl_reject_sweep,
     evaluate_on_test,
+    risk_coverage_sweep,
 )
 
 _COMPARISON_FILENAME = "test_comparison.json"
+_RISK_COVERAGE_FILENAME = "risk_coverage.json"
 
 # Reject-mask thresholds swept for the full-training-set reference: each is a
 # multiplier of the reduced reference Bayes Error. 1.0 is the plain reference.
@@ -94,12 +106,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--reference",
-        choices=("trouble", "all", "none"),
+        choices=("trouble", "all", "none", "random", "risk_coverage"),
         default="trouble",
         help="Reject-mask reference: 'trouble' (trouble_reference subset), "
-        "'all' (the full training set), or 'none' (no reject mask -- evaluate "
+        "'all' (the full training set), 'none' (no reject mask -- evaluate "
         "XGBoost and BDL on the test set and report metrics only, skipping the "
-        "training-set reference reconstruction). Default: trouble.",
+        "training-set reference reconstruction), 'random' (drop test rows "
+        "uniformly at random to --quantile coverage, ignoring uncertainty -- the "
+        "baseline the reject mask must beat at equal coverage), or "
+        "'risk_coverage' (risk--coverage curves for random/bayes_error/"
+        "predictive_entropy/bald/epistemic_var/xgb_margin at matched coverage, "
+        "with AURC; one MC pass, no training-set reconstruction). Default: "
+        "trouble.",
     )
     parser.add_argument(
         "--metric",
@@ -112,7 +130,32 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.95,
         help="Upper-tail cut for trouble_reference (0.95 keeps the most "
-        "uncertain 5%%). Ignored when --reference all. Default: 0.95.",
+        "uncertain 5%%). For --reference random it is reinterpreted as the "
+        "retained coverage fraction (0.95 keeps a random 95%%); set it to a "
+        "reject-mask run's coverage to compare like-for-like. Ignored when "
+        "--reference all. Default: 0.95.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Seed for the --reference random and --reference risk_coverage "
+        "RNGs (random rule and bootstrap). Default: 0.",
+    )
+    parser.add_argument(
+        "--coverages",
+        type=str,
+        default=None,
+        help="--reference risk_coverage only: comma-separated retained fractions "
+        "to evaluate every rule at (e.g. '1.0,0.95,0.9,0.8'). Default: the "
+        "built-in grid down to 0.80.",
+    )
+    parser.add_argument(
+        "--bootstrap",
+        type=int,
+        default=0,
+        help="--reference risk_coverage only: test-set bootstrap resamples for "
+        "AURC/risk error bars (0 = none). Default: 0.",
     )
     parser.add_argument(
         "--reduction",
@@ -161,6 +204,60 @@ def main() -> None:
         out_dir.mkdir(parents=True, exist_ok=True)
         with (out_dir / _COMPARISON_FILENAME).open("w") as f:
             json.dump(results, f, indent=4)
+    elif args.reference == "random":
+        # Random-abstention baseline: drop test rows uniformly at random to the
+        # target coverage, ignoring uncertainty. Like 'none', it needs no
+        # training-set reconstruction -- the mask is drawn on the test set alone.
+        sys.stdout.write(
+            f"Reference:   random (coverage={args.quantile}, seed={args.seed})\n\n"
+        )
+        no_mask, random_mask = evaluate_bdl_random_mask(
+            bdl_model, x_test, y_test, coverage=args.quantile, seed=args.seed
+        )
+        results = {
+            "xgboost": evaluate_on_test(xgb_model, x_test, y_test),
+            "bdl_no_reject_mask": no_mask,
+            "bdl_random_mask": random_mask,
+        }
+        out_dir.mkdir(parents=True, exist_ok=True)
+        with (out_dir / _COMPARISON_FILENAME).open("w") as f:
+            json.dump(results, f, indent=4)
+    elif args.reference == "risk_coverage":
+        # Matched-coverage risk--coverage curves for every abstention rule, from
+        # one MC pass. Like 'none'/'random', no training-set reconstruction.
+        coverages = (
+            [float(c) for c in args.coverages.split(",")]
+            if args.coverages
+            else None
+        )
+        sys.stdout.write(
+            f"Reference:   risk_coverage (bootstrap={args.bootstrap}, "
+            f"seed={args.seed})\n\n"
+        )
+        results = risk_coverage_sweep(
+            bdl_model,
+            xgb_model,
+            x_test,
+            y_test,
+            coverages=coverages,
+            n_bootstrap=args.bootstrap,
+            seed=args.seed,
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        with (out_dir / _RISK_COVERAGE_FILENAME).open("w") as f:
+            json.dump(results, f, indent=4)
+        # AURC league table (lower is better); the headline of the sweep.
+        sys.stdout.write("AURC by abstention rule (balanced error, lower=better):\n")
+        ranked = sorted(results["methods"].items(), key=lambda kv: kv[1]["aurc"])
+        for name, method in ranked:
+            boot = (
+                f" +/- {method['aurc_boot_std']:.5f}"
+                if "aurc_boot_std" in method
+                else ""
+            )
+            sys.stdout.write(f"  {name:<20} {method['aurc']:.5f}{boot}\n")
+        sys.stdout.write(f"\nWrote {out_dir / _RISK_COVERAGE_FILENAME}\n")
+        return
     else:
         # Reject-mask path: reconstruct the training split deterministically and
         # build the reference the mask thresholds against.

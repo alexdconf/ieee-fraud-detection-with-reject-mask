@@ -1,6 +1,6 @@
 # Handoff / project status
 
-Pick-up doc for a fresh agent. Last updated 2026-06-23.
+Pick-up doc for a fresh agent. Last updated 2026-06-30.
 
 ## Goal
 
@@ -153,11 +153,57 @@ they are reconstructed deterministically via the same `holdout_test_split`.
   (`_ALL_REFERENCE_MULTIPLIERS`), one labelled `bdl_reject_mask_x{m}` result each
   (via `evaluate_bdl_reject_sweep` — single MC pass, applies every threshold).
 - `none` — no mask; XGB+BDL test metrics only (fast, skips the reference).
+- `random` — abstention baseline: drop test rows uniformly to `--quantile` coverage
+  (read as the retained fraction here), the floor a real reject rule must beat.
+- `risk_coverage` — the matched-coverage risk–coverage sweep (see below); writes
+  `risk_coverage.json`, prints the AURC league table, `--coverages`/`--bootstrap` tune
+  the grid and error bars.
+
+## Current line of inquiry — risk–coverage harness (the test_comparison work was exploratory)
+
+The per-configuration `test_comparison.json` numbers (single threshold, single
+coverage) were an **exploratory** first pass. They surfaced two confounds that make
+those head-to-head numbers unsafe as model rankings, which motivated a dedicated
+harness:
+
+- **Calibration** — the hard-label metrics (precision/recall/accuracy) depend on each
+  model's probability calibration, which differs (the BDL net trains under a balanced
+  prior). Only PR-AUC (a threshold-free ranking score) is safe *across* models.
+- **Prevalence** — every metric, PR-AUC included, drifts with the positive-class rate
+  (fraud %), which the reject mask changes by dropping rows. So `bdl_no_reject_mask`
+  vs `bdl_reject_mask` is not like-for-like; it is purely a risk–coverage tradeoff
+  (the mask reuses the same `y_pred`, only subsetting rows).
+
+**`risk_coverage_sweep`** (`pipeline_tools.py`;
+`compare_saved_models.py --reference risk_coverage`; plotted by
+`scripts/plot_risk_coverage.py`) compares **abstention rules within one model at
+matched coverage**, where calibration and prevalence cancel. From one MC pass it
+scores `random`, `bayes_error`, `predictive_entropy`, `bald`, `epistemic_var`,
+`xgb_margin`. Glossary:
+- **Coverage** = fraction of rows kept (not abstained on). **Risk–coverage curve** =
+  risk vs. coverage as the rule rejects its most-uncertain rows first. **AURC** = Area
+  Under that curve, one number per rule, lower better. **Risk = balanced error**
+  (`1 − ½(TPR+TNR)`), prevalence-robust so curves at different coverages stay
+  comparable.
+- Since `bayes_error = 1 − max p̄` ≈ the confidence margin (not distinctively
+  Bayesian), **the test is whether `bald`/`epistemic_var` beat
+  `bayes_error`/`predictive_entropy` and `random`.** If not, MC-dropout isn't earning
+  its cost here. This subsumes the old "add BALD to the reject mask" item — BALD is
+  now *evaluated* as a ranking signal, though not yet wired as the default reject-mask
+  metric in `main.py`.
+
+**Preliminary** (`reports/20260625-155136_transactions_only/recompare/risk_coverage.json`,
+**no bootstrap — suggestive only**): `bald` AURC 0.0604 barely beats `random` 0.0640;
+confidence rules 0.0802 are *worse than random*. Rerun with `--bootstrap` for error
+bars before concluding. Figure: `supplementary_material/risk_coverage.png`. Full
+detail: `notes/reject_mask_evaluation.md` (last section).
 
 Still open:
-- **BALD** (epistemic/OOD signal, already in `uncertainty_metrics`) is the next
-  metric to add to the *reject mask itself* — Bayes Error collapses to the mean and
-  carries no disagreement signal (see `bdl_imbalance_calibration.md` §5).
+- **Rerun the risk–coverage sweep with `--bootstrap`** to put error bars on AURC and
+  decide whether `bald`'s edge over `random` is real.
+- Wiring BALD as the reject mask's *default* signal in `main.py` (only if the sweep
+  shows it helps — Bayes Error collapses to the mean and carries no disagreement
+  signal; see `bdl_imbalance_calibration.md` §5).
 - Optional calibration check (reliability curve + Brier) on a fold.
 
 ## Gotchas

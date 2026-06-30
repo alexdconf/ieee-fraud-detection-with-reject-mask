@@ -1,11 +1,18 @@
 # Reject mask & held-out test evaluation
 
-Implemented 2026-06-21; reference + metrics updated 2026-06-25. Covers the
-held-out test split, the full-data refit, and
+Implemented 2026-06-21; reference + metrics updated 2026-06-25; risk–coverage
+harness added 2026-06-30. Covers the held-out test split, the full-data refit, and
 the test-set comparison step that scores XGBoost vs BDL (with and without the
 reject mask). The *conceptual* discussion of the Bayes Error metric and its
 caveats lives in `notes/bdl_imbalance_calibration.md` §5 — this note documents
 what is actually wired up in code.
+
+**Framing:** the single-operating-point comparison below (one threshold, one
+coverage, per-configuration `test_comparison.json`) was an **exploratory** first
+pass. It did its job — it exposed *why* those head-to-head numbers are unsafe to
+read as model rankings — and that motivated the matched-coverage **risk–coverage
+harness** documented in the new section at the end. Read this note as: exploratory
+eval first, then the harness it led to.
 
 All functions are in `src/utils/pipeline_tools.py`; the split helper is in
 `src/utils/data_handlers.py`; everything is orchestrated in `src/main.py`.
@@ -130,6 +137,73 @@ target coverage is wanted. (Synthetic smoke check: mean reference → ~47% cover
 scalar via `evaluate_bdl_reject_sweep` (one MC pass over the test set, every
 threshold applied), writing one labelled `bdl_reject_mask_x{m}` result each;
 `--reference none` skips the mask entirely. See `notes/handoff.md` for usage.
+
+## Risk–coverage harness (matched-coverage abstention comparison)
+
+Added 2026-06-30 (`risk_coverage_sweep` in `pipeline_tools.py`;
+`--reference risk_coverage` in `compare_saved_models.py`; plotting in
+`scripts/plot_risk_coverage.py`). This is the **current line of inquiry**; the
+single-point eval above was the exploratory groundwork.
+
+**Why it exists.** Two confounds make the exploratory comparisons unsafe to read
+head-to-head:
+
+1. **Calibration.** The hard-label metrics (precision/recall/accuracy) apply a fixed
+   threshold to predicted probabilities, so they depend on each model's
+   *calibration* — how well its probabilities match observed frequencies. XGBoost and
+   the BDL net are not calibrated alike (the BDL net trains under a balanced class
+   prior, shifting its probabilities), so a fixed-threshold comparison conflates
+   ranking ability with calibration. Only a threshold-free ranking metric (PR-AUC) is
+   safe *across models*.
+2. **Prevalence.** Every metric — PR-AUC included — moves with the positive-class
+   **prevalence** (fraud rate of the scored rows). The reject mask changes prevalence
+   by dropping rows (PR-AUC's no-skill baseline *is* the prevalence), so
+   `bdl_no_reject_mask` vs `bdl_reject_mask` is not like-for-like — the populations
+   differ. Because the mask reuses the same `y_pred` and only subsets the rows, that
+   pairing is purely a *risk–coverage* tradeoff and must be read as one.
+
+**What it does.** Compares **abstention rules within one model at matched coverage**,
+where calibration and prevalence are held fixed and cancel. Terms:
+
+- **Coverage** — fraction of test rows kept (not abstained on); 1.0 = predict on all.
+- **Risk–coverage curve** — risk vs. coverage as the rule abstains on its
+  most-uncertain rows first; a good signal makes risk fall as coverage drops.
+- **AURC** — Area Under the Risk–Coverage curve (trapezoidal; lower is better) — one
+  number per rule. `_aurc` integrates only finite points, so an undefined risk at
+  aggressive coverage drops out instead of poisoning the area.
+- **Balanced error** — the risk used: `1 − ½(TPR + TNR)` (TPR = recall on fraud, TNR
+  = recall on legit). Prevalence-robust — each class contributes equally regardless
+  of how abstention reshaped the class balance — so curves at different coverages stay
+  comparable. `_balanced_error` returns `nan` when the kept subset has lost a class
+  (honest about degenerate coverage rather than averaging over the survivor); the
+  default grid stops at 0.80 coverage to avoid that on this imbalance.
+
+**Rules scored** (all from one MC-dropout pass; `random` and `xgb_margin` aside, all
+keep the BDL predictions and differ only in *which rows* they reject):
+
+| rule | rejects by | family |
+| --- | --- | --- |
+| `random` | uniform noise | floor every rule must beat |
+| `bayes_error` | `1 − max p̄` (predictive confidence) | confidence (≈ free, non-Bayesian) |
+| `predictive_entropy` | entropy of the mean prediction | confidence |
+| `bald` | BALD — MC-pass disagreement (mutual info) | epistemic |
+| `epistemic_var` | variance of per-pass probabilities | epistemic |
+| `xgb_margin` | XGBoost confidence over its own predictions | cross-model baseline |
+
+In the binary case `bayes_error = 1 − max p̄` is monotone with the confidence margin,
+so it is essentially the *confidence* baseline, not a distinctively Bayesian one. **The
+real test is whether `bald`/`epistemic_var` beat `bayes_error`/`predictive_entropy`
+and `random`.** If they don't, the MC-dropout machinery isn't earning its cost here.
+`--bootstrap N` resamples the test set for AURC/risk error bars (the MC pass is done
+once; only the rows are resampled), so "beats random" can be judged against noise.
+
+**Preliminary read** (`reports/20260625-155136_transactions_only/recompare/risk_coverage.json`,
+**no bootstrap yet** — treat as suggestive, not significant): on balanced-error AURC,
+`bald` (0.0604) just edges `random` (0.0640); the confidence rules `bayes_error` /
+`predictive_entropy` (0.0802) are *worse than random* — confidence-based abstention
+preferentially discards boundary frauds on this imbalance. Rerun with `--bootstrap`
+before drawing any firm conclusion. Figure:
+`supplementary_material/risk_coverage.png`.
 
 ## Status of `main.py`
 

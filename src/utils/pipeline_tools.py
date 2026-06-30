@@ -948,6 +948,270 @@ def evaluate_bdl_reject_sweep(
     return no_mask, reject_masks
 
 
+def evaluate_bdl_random_mask(
+    model: Pipeline,
+    x_test: pdDataFrame,
+    y_test: np.ndarray,
+    coverage: float,
+    seed: int = 0,
+) -> tuple[dict[str, float], dict[str, float | None]]:
+    """Evaluate the BDL pipeline on test with a *random* reject mask.
+
+    Identical bookkeeping to ``evaluate_bdl_on_test`` -- the same single
+    MC-dropout pass produces ``y_score`` and ``y_pred`` -- but the kept subset is
+    drawn uniformly at random to hit ``coverage`` instead of by Bayes Error. This
+    is the abstention baseline the Bayes-Error reject mask must beat: dropping the
+    same fraction of rows at random leaves the retained-subset metrics changed
+    only by sampling noise (the population is statistically unchanged), so if the
+    reject mask does no better than this at equal coverage, the uncertainty signal
+    is adding nothing.
+
+    Args:
+        model: The BDL pipeline fitted on the full training set (its final step
+            is an ``MCDropoutClassifier``).
+        x_test: The held-out test features (same column layout as training X).
+        y_test: The held-out test labels.
+        coverage: Fraction of rows to keep, in ``[0, 1]``; ``1 - coverage`` are
+            rejected uniformly at random.
+        seed: Seed for the row-dropping RNG, for reproducibility.
+
+    Returns:
+        ``(no_mask_metrics, random_mask_metrics)``. The masked dict also carries
+        ``coverage``, ``n_rejected`` and the requested ``target_coverage``.
+
+    """
+    classifier = model[-1]
+    x_pre = model[:-1].transform(x_test)
+    metrics = classifier.uncertainty_metrics(x_pre)
+    proba = metrics["mean_proba"]
+    y_score = proba[:, 1]
+    y_pred = classifier.classes_[np.argmax(proba, axis=1)]
+
+    no_mask = _binary_metrics(y_test, y_score, y_pred)
+
+    # Keep a uniformly-random subset of the requested size, ignoring uncertainty.
+    n = len(y_test)
+    n_keep = int(round(coverage * n))
+    keep_mask = np.zeros(n, dtype=bool)
+    keep_idx = np.random.default_rng(seed).choice(n, size=n_keep, replace=False)
+    keep_mask[keep_idx] = True
+    random_mask = _masked_metrics(y_test, y_score, y_pred, keep_mask)
+    random_mask["target_coverage"] = float(coverage)
+
+    return no_mask, random_mask
+
+
+# Default coverage grid for the risk--coverage sweep: every abstention rule is
+# evaluated at these exact retained fractions, so the curves are directly
+# comparable. Stops at 0.80 because below that the retained set can shed the
+# whole positive class on this imbalance, making balanced error undefined.
+_DEFAULT_RISK_COVERAGES = (1.0, 0.99, 0.98, 0.97, 0.95, 0.93, 0.90, 0.85, 0.80)
+
+
+def _balanced_error(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Balanced error rate ``1 - 0.5*(TPR + TNR)`` for binary 0/1 labels.
+
+    Prevalence-robust (each class contributes equally regardless of how the
+    abstention rule reshaped the retained class balance), unlike plain error
+    which the majority class dominates. Returns ``nan`` when the retained subset
+    lacks a class, since the rate for that class is undefined -- honest about
+    degenerate coverage rather than averaging over whichever class survived.
+    """
+    pos = y_true == 1
+    neg = ~pos
+    if not pos.any() or not neg.any():
+        return float("nan")
+    tpr = float((y_pred[pos] == 1).mean())
+    tnr = float((y_pred[neg] == 0).mean())
+    return 1.0 - 0.5 * (tpr + tnr)
+
+
+def _aurc(coverages: Sequence[float], risks: Sequence[float]) -> float:
+    """Trapezoidal area under the risk--coverage curve. Lower is better.
+
+    Integrates ``risk`` against ``coverage`` using only finite points, so an
+    undefined balanced error at aggressive coverage drops out instead of
+    poisoning the whole area.
+    """
+    cov = np.asarray(coverages, dtype=float)
+    rk = np.asarray(risks, dtype=float)
+    finite = np.isfinite(rk)
+    if int(finite.sum()) < 2:
+        return float("nan")
+    order = np.argsort(cov[finite])
+    return float(np.trapezoid(rk[finite][order], cov[finite][order]))
+
+
+def _risk_coverage_bootstrap(
+    out: dict[str, Any],
+    methods: dict[str, tuple[str, np.ndarray]],
+    preds: dict[str, tuple[np.ndarray, np.ndarray]],
+    y_true: np.ndarray,
+    coverages: Sequence[float],
+    n_bootstrap: int,
+    seed: int,
+) -> None:
+    """Add bootstrap error bars to a ``risk_coverage_sweep`` result, in place.
+
+    Resamples the test rows with replacement ``n_bootstrap`` times and re-runs
+    each method's coverage thresholding on the resample (the per-row scores are
+    fixed; only the row sample varies), recomputing balanced error -- cheaply,
+    skipping the descriptive PR-AUC/precision in the loop. Writes ``risk_lo`` /
+    ``risk_hi`` (2.5/97.5 percentiles) per point and ``aurc_boot_mean`` /
+    ``aurc_boot_std`` per method.
+    """
+    n = len(y_true)
+    n_cov = len(coverages)
+    rng = np.random.default_rng(seed + 1)
+    risks = {name: np.full((n_bootstrap, n_cov), np.nan) for name in methods}
+    aurcs = {name: np.full(n_bootstrap, np.nan) for name in methods}
+    for b in range(n_bootstrap):
+        idx = rng.integers(0, n, size=n)
+        y_resampled = y_true[idx]
+        for name, (src, uncertainty) in methods.items():
+            _, y_pred = preds[src]
+            y_pred_resampled = y_pred[idx]
+            # Random rule: redraw its noise per resample so the band reflects
+            # both row resampling and the arbitrary draw.
+            unc = rng.random(n) if name == "random" else uncertainty[idx]
+            order = np.argsort(unc, kind="stable")
+            for j, coverage in enumerate(coverages):
+                keep = order[: int(round(coverage * n))]
+                risks[name][b, j] = _balanced_error(
+                    y_resampled[keep], y_pred_resampled[keep]
+                )
+            aurcs[name][b] = _aurc(coverages, risks[name][b])
+    for name in methods:
+        lo = np.nanpercentile(risks[name], 2.5, axis=0)
+        hi = np.nanpercentile(risks[name], 97.5, axis=0)
+        for j, point in enumerate(out["methods"][name]["points"]):
+            point["risk_lo"] = float(lo[j])
+            point["risk_hi"] = float(hi[j])
+        out["methods"][name]["aurc_boot_mean"] = float(np.nanmean(aurcs[name]))
+        out["methods"][name]["aurc_boot_std"] = float(np.nanstd(aurcs[name]))
+
+
+def risk_coverage_sweep(  # noqa: PLR0913
+    bdl_model: Pipeline,
+    xgb_model: Pipeline,
+    x_test: pdDataFrame,
+    y_test: np.ndarray,
+    coverages: Sequence[float] | None = None,
+    n_bootstrap: int = 0,
+    seed: int = 0,
+) -> dict[str, Any]:
+    """Risk--coverage curves for several abstention rules at matched coverage.
+
+    The point of the BDL reject-mask experiment isn't "does rejecting help?"
+    (trivially yes -- you drop hard cases) but "does the BDL *uncertainty* pick
+    which rows to drop better than cheaper rules?" This evaluates every rule at
+    the *same* retained fractions so their curves are directly comparable, all
+    from a single MC-dropout pass over the test set (no retraining):
+
+      * ``random``             -- drop rows uniformly (the floor every rule must beat)
+      * ``bayes_error``        -- 1 - max predictive prob (≈ confidence margin)
+      * ``predictive_entropy`` -- H(p̄), the entropy-flavoured confidence
+      * ``bald``               -- epistemic disagreement across MC passes
+      * ``epistemic_var``      -- per-pass probability variance (epistemic)
+      * ``xgb_margin``         -- XGBoost's own confidence (its predictions kept)
+
+    ``bayes_error``/``predictive_entropy`` are level-based confidence -- what a
+    non-Bayesian model gives for free -- so ``bald``/``epistemic_var`` must beat
+    *them* (not just ``random``) for the MC-dropout machinery to earn its cost.
+    The risk is balanced error (prevalence-robust; see ``_balanced_error``) and
+    each curve is summarised by its AURC (lower is better).
+
+    Args:
+        bdl_model: The fitted BDL pipeline (final step an ``MCDropoutClassifier``).
+        xgb_model: The fitted XGBoost pipeline, for the cross-model baseline.
+        x_test: Held-out test features.
+        y_test: Held-out test labels.
+        coverages: Retained fractions to evaluate; defaults to
+            ``_DEFAULT_RISK_COVERAGES``.
+        n_bootstrap: Test-set bootstrap resamples for error bars (0 = none).
+        seed: Seed for the random rule and the bootstrap.
+
+    Returns:
+        A dict with ``coverages``, ``risk_metric``, ``n_test`` and ``methods``
+        (each carrying ``predictions``, ``aurc``, ``points``, and -- when
+        bootstrapped -- ``aurc_boot_mean``/``aurc_boot_std`` and per-point bands).
+
+    """
+    coverages = tuple(_DEFAULT_RISK_COVERAGES if coverages is None else coverages)
+    y_true = np.asarray(y_test).astype(int)
+    n = len(y_true)
+    rng = np.random.default_rng(seed)
+
+    # One MC-dropout pass: every BDL score from the same predictive distribution.
+    classifier = bdl_model[-1]
+    mc = classifier.uncertainty_metrics(bdl_model[:-1].transform(x_test))
+    bdl_proba = mc["mean_proba"]
+    bdl_score = bdl_proba[:, 1]
+    bdl_pred = classifier.classes_[np.argmax(bdl_proba, axis=1)].astype(int)
+
+    # One XGBoost pass for the cross-model selective baseline (its own decisions).
+    xgb_proba = xgb_model.predict_proba(x_test)
+    xgb_pred = xgb_model.classes_[np.argmax(xgb_proba, axis=1)].astype(int)
+
+    # name -> (predictions source, per-row uncertainty where higher = reject first)
+    methods: dict[str, tuple[str, np.ndarray]] = {
+        "random": ("bdl", rng.random(n)),
+        "bayes_error": ("bdl", mc["bayes_error"]),
+        "predictive_entropy": ("bdl", mc["predictive_entropy"]),
+        "bald": ("bdl", mc["bald"]),
+        "epistemic_var": ("bdl", mc["epistemic_var"]),
+        "xgb_margin": ("xgb", 1.0 - xgb_proba.max(axis=1)),
+    }
+    preds: dict[str, tuple[np.ndarray, np.ndarray]] = {
+        "bdl": (bdl_score, bdl_pred),
+        "xgb": (xgb_proba[:, 1], xgb_pred),
+    }
+
+    out: dict[str, Any] = {
+        "coverages": [float(c) for c in coverages],
+        "risk_metric": "balanced_error",
+        "n_test": int(n),
+        "methods": {},
+    }
+    for name, (src, uncertainty) in methods.items():
+        y_score, y_pred = preds[src]
+        order = np.argsort(uncertainty, kind="stable")  # most certain kept first
+        points: list[dict[str, Any]] = []
+        risks: list[float] = []
+        for coverage in coverages:
+            keep_mask = np.zeros(n, dtype=bool)
+            keep_mask[order[: int(round(coverage * n))]] = True
+            metrics = _masked_metrics(y_true, y_score, y_pred, keep_mask)
+            kept_true = y_true[keep_mask]
+            balanced_error = _balanced_error(kept_true, y_pred[keep_mask])
+            accuracy = metrics.get("accuracy")
+            points.append(
+                {
+                    "coverage_requested": float(coverage),
+                    "coverage": metrics["coverage"],
+                    "n_samples": metrics.get("n_samples"),
+                    "prevalence": float(kept_true.mean()) if keep_mask.any() else None,
+                    "balanced_error": balanced_error,
+                    "selective_error": None if accuracy is None else 1.0 - accuracy,
+                    "pr_auc": metrics.get("pr_auc"),
+                    "precision": metrics.get("precision"),
+                    "recall": metrics.get("recall"),
+                }
+            )
+            risks.append(balanced_error)
+        out["methods"][name] = {
+            "predictions": src,
+            "aurc": _aurc(coverages, risks),
+            "points": points,
+        }
+
+    if n_bootstrap > 0:
+        _risk_coverage_bootstrap(
+            out, methods, preds, y_true, coverages, n_bootstrap, seed
+        )
+    return out
+
+
 def compare_models_on_test(  # noqa: PLR0913
     xgb_model: Pipeline,
     bdl_model: Pipeline,
