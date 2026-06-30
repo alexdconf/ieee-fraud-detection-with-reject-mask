@@ -47,11 +47,13 @@ Once BALD was discovered for this data set for Reject Mask, PR-AUC is the perfor
 There were two findings for this data set. The first is that the BALD abstention rule works best out of the abstention rules considered. The second finding is that using BALD as a Reject Mask abstention rule for this data set is significant; precision can increase substantially over not having the Reject Mask post-processing step for the BDL NN. When inspecting results between BDL NN (with or without Reject Mask) using non-PR-AUC metrics, `coverage` must be the same.
 
 # Discussion
-The entire point of this technique is to improve model performance by calculating whether or not predictions are significant with as little human tuning as possible. Aside from requiring BDL with some other modifications to what is essentially a regular ANN, everything Reject Mask related happens after a prediction.
+The entire point of this technique is to improve model performance by calculating whether or not predictions are significant with as little human tuning as possible. Aside from requiring BDL with some other modifications to what is essentially a regular ANN, everything Reject Mask related happens after a prediction. See `uncertianty_metrics` in the file `pipeline_tools.py` to see how metrics are calculated.
 
 # Improvements and Next Steps
 Try more data sets
+
 Better performing models here, to see if there's any meaningful change in results
+
 More reject metrics and methods to try for new data sets (probably find a new abstention rule per data set)
 
-# Lessons Learned
+Real world application with side-by-side models (existing versus Reject Mask)
