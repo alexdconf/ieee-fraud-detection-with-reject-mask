@@ -6,11 +6,15 @@ import sys
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+import numpy as np
+
 import constants
 from utils.data_handlers import (
     column_types,
     correlation_and_variance,
+    features_and_target,
     get_numeric_and_categorical_columns,
+    holdout_test_split,
     load_csv_data,
     merge_transaction_and_identity,
     null_profile,
@@ -18,6 +22,8 @@ from utils.data_handlers import (
 )
 from utils.pipeline_tools import (
     bdl_reference,
+    compare_models_on_test,
+    fit_full_model,
     mlp_reference,
     run_pipeline,
     save_pipeline_params,
@@ -26,6 +32,8 @@ from utils.pipeline_tools import (
 
 if TYPE_CHECKING:
     import polars as pl
+    from pandas import DataFrame as pdDataFrame
+    from sklearn.pipeline import Pipeline
 
 
 def merge(
@@ -43,6 +51,42 @@ def merge(
 
     """
     return merge_transaction_and_identity(train_transactions_df, train_identity_df)
+
+
+def trouble_reference(
+    model: Pipeline,
+    x: pdDataFrame,
+    *,
+    metric: str = "bayes_error",
+    quantile: float = 0.95,
+) -> pdDataFrame:
+    """Select the reference subset the model is most uncertain about.
+
+    Scores every row of ``x`` through the fitted BDL ``model`` with one
+    MC-dropout pass and keeps the upper tail of ``metric`` -- by default the top
+    5% by Bayes Error, the exact quantity the reject mask thresholds. This is the
+    "all-weird" reference (notes/bdl_imbalance_calibration.md §5): rows the model
+    demonstrably has trouble with, so the mask only rejects test data more
+    uncertain than cases already known to be hard.
+
+    Args:
+        model: The BDL pipeline fitted on the training set (its final step must
+            expose ``uncertainty_metrics``).
+        x: Training features to draw the reference subset from.
+        metric: Which per-sample uncertainty metric to rank by (e.g.
+            ``"bayes_error"`` or ``"bald"``).
+        quantile: Lower bound of the retained upper tail (``0.95`` keeps the most
+            uncertain 5%).
+
+    Returns:
+        The subset of ``x`` in the upper ``1 - quantile`` tail of ``metric``.
+
+    """
+    classifier = model[-1]
+    x_pre = model[:-1].transform(x)
+    values = classifier.uncertainty_metrics(x_pre)[metric]
+    threshold = np.quantile(values, quantile)
+    return x[values >= threshold]
 
 
 def main() -> None:
@@ -131,34 +175,47 @@ def main() -> None:
     report_dir = constants.REPORTS_DIR / report_name
     report_dir.mkdir(parents=True, exist_ok=True)
 
-    column_types(train_transactions_df, report_dir)
-    null_profile(train_transactions_df, report_dir)
-    correlation_and_variance(train_transactions_df, report_dir)
+    # Hold out the most recent transactions as a labeled test set, reserved for
+    # later evaluation. Everything below (EDA, CV search, full refit) only sees
+    # train_df; the test set is never touched during training.
+    train_df, test_df = holdout_test_split(
+        train_transactions_df,
+        constants.TIMESTAMP,
+        test_fraction=0.2,
+    )
+    test_df.write_parquet(report_dir / "holdout_test.parquet")
 
-    # NaNs as is
-    # report_name = "xgboost_reference"
-    # raw_report_dir = report_dir / report_name
-    # _, trans_cat_cols = get_numeric_and_categorical_columns(
-    #     train_transactions_df,
-    #     exclude_columns=[constants.TARGET, constants.TIMESTAMP],
-    # )
-    # transactions_pipeline, transactions_param_distributions = xgboost_reference(
-    #     categorical_features=trans_cat_cols,
-    # )
-    # save_pipeline_params(transactions_pipeline, raw_report_dir)
-    # x, y, tscv = time_series_split(
-    #     train_transactions_df,
-    #     constants.TARGET,
-    #     constants.TIMESTAMP,
-    # )
-    # run_pipeline(
-    #     transactions_pipeline,
-    #     transactions_param_distributions,
-    #     tscv,
-    #     x,
-    #     y,
-    #     raw_report_dir,
-    # )
+    column_types(train_df, report_dir)
+    null_profile(train_df, report_dir)
+    correlation_and_variance(train_df, report_dir)
+
+    # NaNs as is: xgboost
+    report_name = "xgboost_reference"
+    raw_report_dir = report_dir / report_name
+    _, trans_cat_cols = get_numeric_and_categorical_columns(
+        train_df,
+        exclude_columns=[constants.TARGET, constants.TIMESTAMP],
+    )
+    transactions_pipeline, transactions_param_distributions = xgboost_reference(
+        categorical_features=trans_cat_cols,
+    )
+    save_pipeline_params(transactions_pipeline, raw_report_dir)
+    x, y, tscv = time_series_split(
+        train_df,
+        constants.TARGET,
+        constants.TIMESTAMP,
+    )
+    run_pipeline(
+        transactions_pipeline,
+        transactions_param_distributions,
+        tscv,
+        x,
+        y,
+        raw_report_dir,
+    )
+    # Separate full-data refit: take the best CV params and train one model on
+    # all of train_df, saving it as the deployable artifact.
+    xgb_model = fit_full_model(transactions_pipeline, x, y, raw_report_dir)
 
     # NaNs imputed: MLP
     # report_name = "mlp_reference"
@@ -190,7 +247,7 @@ def main() -> None:
     print(f"report name: {report_name}")
     imputed_report_dir = report_dir / report_name
     trans_num_cols, trans_cat_cols = get_numeric_and_categorical_columns(
-        train_transactions_df,
+        train_df,
         exclude_columns=[constants.TARGET, constants.TIMESTAMP],
     )
     transactions_pipeline, transactions_param_distributions = bdl_reference(
@@ -198,7 +255,7 @@ def main() -> None:
     )
     save_pipeline_params(transactions_pipeline, imputed_report_dir)
     x, y, tscv = time_series_split(
-        train_transactions_df,
+        train_df,
         constants.TARGET,
         constants.TIMESTAMP,
     )
@@ -209,6 +266,36 @@ def main() -> None:
         x,
         y,
         imputed_report_dir,
+    )
+    # Separate full-data refit: take the best CV params and train one model on
+    # all of train_df, saving it as the deployable artifact.
+    bdl_model = fit_full_model(transactions_pipeline, x, y, imputed_report_dir)
+
+    # Test step: score the deployable XGBoost and BDL models on the held-out
+    # test set never seen during EDA/CV/refit. Surfaces PR-AUC and precision for
+    # XGBoost, BDL without a reject mask, and BDL with a reject mask, writing the
+    # side-by-side comparison to report_dir/test_comparison.json. The BDL reject
+    # mask rejects test data whose Bayes Error exceeds a reference scalar computed
+    # from a *reference set* (x_reference).
+    x_test, y_test = features_and_target(
+        test_df,
+        constants.TARGET,
+        constants.TIMESTAMP,
+    )
+
+    # Reference set for the BDL reject mask: the rows the model is most uncertain
+    # about (top 5% by Bayes Error). The mask thresholds test data against the
+    # mean Bayes Error of this "all-weird" reference, so it only rejects points
+    # weirder than cases the model already demonstrably struggles with.
+    x_reference = trouble_reference(bdl_model, x)
+
+    compare_models_on_test(
+        xgb_model,
+        bdl_model,
+        x_reference,
+        x_test,
+        y_test,
+        report_dir,
     )
     #############################################
     # Try just transactions without the left join

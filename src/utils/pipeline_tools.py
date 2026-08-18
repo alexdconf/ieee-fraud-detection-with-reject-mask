@@ -5,18 +5,30 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Any
 
+import joblib
 import numpy as np
 import torch
 from scipy.stats import randint, uniform
 from scipy.stats.distributions import loguniform
-from sklearn.base import BaseEstimator, ClassifierMixin
+from sklearn.base import BaseEstimator, ClassifierMixin, clone
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import average_precision_score, make_scorer
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    make_scorer,
+    precision_score,
+    recall_score,
+)
 from sklearn.model_selection import RandomizedSearchCV
 from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OrdinalEncoder, StandardScaler
+from sklearn.preprocessing import (
+    OrdinalEncoder,
+    QuantileTransformer,
+    StandardScaler,
+    TargetEncoder,
+)
 from sklearn.utils.multiclass import unique_labels
 from sklearn.utils.validation import check_array, check_is_fitted, check_X_y
 from torch import nn
@@ -24,10 +36,16 @@ from torch.utils.data import DataLoader, TensorDataset
 from xgboost import XGBClassifier
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from pathlib import Path
 
     from pandas import DataFrame as pdDataFrame
     from sklearn.model_selection import TimeSeriesSplit
+
+
+# Filename used both when persisting CV results and when reading them back to
+# refit on the full training set (see fit_full_model).
+_RESULTS_FILENAME = "pipeline_results.json"
 
 
 def _save_pipeline_results(
@@ -48,9 +66,30 @@ def _save_pipeline_results(
         "best_score": best_score,
         "best_params": best_params,
     }
-    file_path = dirpath / "pipeline_results.json"
+    file_path = dirpath / _RESULTS_FILENAME
     with file_path.open("w") as f:
         json.dump(results, f, indent=4)
+
+
+def _save_best_model(estimator: Pipeline, dirpath: Path) -> None:
+    """Persist the fitted best pipeline (preprocessing + model) to disk.
+
+    Saves the entire fitted Pipeline, so inference reuses the exact fitted
+    preprocessing (TargetEncoder mappings, QuantileTransformer quantiles,
+    imputer statistics) together with the trained classifier. Reload with
+    ``joblib.load(path)`` (with ``src`` importable so the custom
+    ``MCDropoutClassifier`` / ``_MCDropoutNet`` classes resolve). The PyTorch
+    weights are pickled in place; ``predict_proba`` moves the module onto the
+    resolved device on load, so the artifact reloads on CPU or GPU.
+
+    Args:
+        estimator: The pipeline fitted on the full training set (the model
+            returned by ``fit_full_model``).
+        dirpath: Directory to save the model into.
+
+    """
+    dirpath.mkdir(parents=True, exist_ok=True)
+    joblib.dump(estimator, dirpath / "best_model.joblib")
 
 
 def _save_grid_search_params(grid_search: Any, dirpath: Path) -> None:
@@ -133,7 +172,12 @@ def xgboost_reference(
         remainder="passthrough",
     )
 
-    clf = XGBClassifier(objective="binary:logistic", device="cuda")
+    # CPU hist: the sklearn Pipeline feeds host (CPU) numpy, so device="cuda"
+    # forced a CPU->GPU copy / DMatrix fallback every call. On this tabular size
+    # CPU hist avoids that overhead and the device-mismatch warning.
+    clf = XGBClassifier(
+        objective="binary:logistic", tree_method="hist", device="cpu", n_jobs=2
+    )
     pipe = Pipeline(
         steps=[
             ("preprocessor", preprocessor),
@@ -173,20 +217,28 @@ def mlp_reference(
     if numeric_features is None:
         numeric_features = []
 
+    # Cross-fitted TargetEncoder (CV-safe) replaces OrdinalEncoder: it maps
+    # categories to a meaningful, bounded scale (smoothed P(fraud|category))
+    # instead of arbitrary integer codes, so high-cardinality columns no longer
+    # enter the net unscaled and fake-ordered. StandardScaler then puts the
+    # encoded values on the same ~unit-variance footing as the numerics.
     cat_transformer = Pipeline(
         steps=[
             ("imputer", SimpleImputer(strategy="most_frequent")),
-            (
-                "encoder",
-                OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1),
-            ),
+            ("encoder", TargetEncoder(target_type="binary", random_state=42)),
+            ("scaler", StandardScaler()),
         ],
     )
 
+    # QuantileTransformer is rank-based, so it handles both the heavy tails and
+    # the zero-IQR sparsity that broke RobustScaler (see preprocessing_findings).
     num_transformer = Pipeline(
         steps=[
             ("imputer", SimpleImputer(strategy="median")),
-            ("scaler", StandardScaler()),
+            (
+                "scaler",
+                QuantileTransformer(output_distribution="normal", random_state=42),
+            ),
         ],
     )
 
@@ -363,9 +415,7 @@ class MCDropoutClassifier(ClassifierMixin, BaseEstimator):
         probabilities. None when no correction applies.
         """
         if self.prior_correction and self.log_prior_ is not None:
-            return torch.as_tensor(
-                self.log_prior_, dtype=torch.float32, device=device
-            )
+            return torch.as_tensor(self.log_prior_, dtype=torch.float32, device=device)
         return None
 
     def predict_proba(self, x: Any) -> np.ndarray:  # noqa: ANN401
@@ -373,6 +423,8 @@ class MCDropoutClassifier(ClassifierMixin, BaseEstimator):
         check_is_fitted(self)
         x = check_array(x)
         device = self._resolve_device()
+        # Keep the (possibly just-unpickled) module and inputs on one device.
+        self.module_.to(device)
         x_tensor = torch.as_tensor(np.asarray(x), dtype=torch.float32).to(device)
         log_prior = self._logit_offset(device)
 
@@ -421,6 +473,8 @@ class MCDropoutClassifier(ClassifierMixin, BaseEstimator):
         check_is_fitted(self)
         x = check_array(x)
         device = self._resolve_device()
+        # Keep the (possibly just-unpickled) module and inputs on one device.
+        self.module_.to(device)
         x_tensor = torch.as_tensor(np.asarray(x), dtype=torch.float32).to(device)
         log_prior = self._logit_offset(device)
 
@@ -477,20 +531,28 @@ def bdl_reference(
     if numeric_features is None:
         numeric_features = []
 
+    # Cross-fitted TargetEncoder (CV-safe) replaces OrdinalEncoder: it maps
+    # categories to a meaningful, bounded scale (smoothed P(fraud|category))
+    # instead of arbitrary integer codes, so high-cardinality columns no longer
+    # enter the net unscaled and fake-ordered. StandardScaler then puts the
+    # encoded values on the same ~unit-variance footing as the numerics.
     cat_transformer = Pipeline(
         steps=[
             ("imputer", SimpleImputer(strategy="most_frequent")),
-            (
-                "encoder",
-                OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1),
-            ),
+            ("encoder", TargetEncoder(target_type="binary", random_state=42)),
+            ("scaler", StandardScaler()),
         ],
     )
 
+    # QuantileTransformer is rank-based, so it handles both the heavy tails and
+    # the zero-IQR sparsity that broke RobustScaler (see preprocessing_findings).
     num_transformer = Pipeline(
         steps=[
             ("imputer", SimpleImputer(strategy="median")),
-            ("scaler", StandardScaler()),
+            (
+                "scaler",
+                QuantileTransformer(output_distribution="normal", random_state=42),
+            ),
         ],
     )
 
@@ -545,6 +607,10 @@ def run_pipeline(  # noqa: PLR0913
         average_precision_score, response_method="predict_proba"
     )
 
+    # refit=False: the search only selects hyperparameters here. The single
+    # full-training-set fit (and the saved best_model.joblib) is produced by
+    # fit_full_model, so refitting best_estimator_ on all of x, y would be a
+    # wasted training pass (notably for the BDL torch model).
     grid_search = RandomizedSearchCV(
         estimator=pipe,
         param_distributions=param_distributions,
@@ -553,6 +619,7 @@ def run_pipeline(  # noqa: PLR0913
         n_jobs=n_jobs,
         verbose=1,
         random_state=42,
+        refit=False,
     )
 
     _save_grid_search_params(grid_search, dirpath)
@@ -564,3 +631,652 @@ def run_pipeline(  # noqa: PLR0913
         grid_search.best_params_,
         dirpath,
     )
+
+
+def fit_full_model(
+    pipe: Pipeline,
+    x: pdDataFrame,
+    y: Any,  # noqa: ANN401
+    dirpath: Path,
+) -> Pipeline:
+    """Refit a pipeline on the full training set using the best CV params.
+
+    Reads ``best_params`` from the ``pipeline_results.json`` written by
+    ``run_pipeline`` in ``dirpath``, applies them to a fresh clone of ``pipe``,
+    and fits once on the entire provided training set (no cross-validation
+    holdout). The fitted model is persisted to ``dirpath`` via
+    ``_save_best_model``. This is deliberately separate from the CV search: CV
+    selects the hyperparameters, this turns them into the deployable model.
+
+    Args:
+        pipe: An unfitted pipeline of the same structure used during the search
+            (e.g. the one returned by ``xgboost_reference``/``bdl_reference``).
+        x: The full training feature DataFrame.
+        y: The full training target.
+        dirpath: Directory holding ``pipeline_results.json``; the fitted model
+            is saved here too.
+
+    Returns:
+        The pipeline fitted on the full training set.
+
+    """
+    results_path = dirpath / _RESULTS_FILENAME
+    with results_path.open() as f:
+        best_params = json.load(f)["best_params"]
+
+    model = clone(pipe)
+    model.set_params(**best_params)
+    model.fit(x, y)
+
+    _save_best_model(model, dirpath)
+    return model
+
+
+# Filename used to persist the side-by-side test-set comparison (see
+# compare_models_on_test).
+_TEST_COMPARISON_FILENAME = "test_comparison.json"
+
+
+def _binary_metrics(
+    y_true: np.ndarray,
+    y_score: np.ndarray,
+    y_pred: np.ndarray,
+) -> dict[str, float]:
+    """Compute PR-AUC (from scores) and precision/recall/accuracy (hard labels).
+
+    PR-AUC is a ranking metric and needs the continuous positive-class score; the
+    hard-label metrics (precision, recall, accuracy) need the model's decision.
+    Keeping the two inputs separate (rather than re-thresholding the score here)
+    means the hard-label metrics reflect the model's own decision rule and stay
+    consistent with ``y_score`` even for the stochastic BDL model, where
+    ``y_pred`` is the ``argmax`` of the same pass.
+
+    Args:
+        y_true: Ground-truth binary labels.
+        y_score: Predicted probability of the positive (fraud) class.
+        y_pred: The model's predicted hard labels.
+
+    Precision and recall are surfaced both altogether and per class. The flat
+    ``precision``/``recall`` are the positive-class (fraud) figures and
+    ``accuracy`` is overall; ``precision_macro``/``recall_macro`` are the
+    unweighted means across classes, and ``precision_per_class``/
+    ``recall_per_class`` map each class label to its own figure. (Per-class
+    accuracy is omitted: the share of a class's samples predicted correctly is
+    identical to that class's recall, so read ``recall_per_class`` for it.)
+
+    Returns:
+        A dict with ``pr_auc``, ``precision``, ``recall``, ``accuracy``,
+        ``precision_macro``, ``recall_macro``, ``precision_per_class``,
+        ``recall_per_class`` and the supporting ``n_samples``.
+
+    """
+    labels = np.unique(y_true)
+    precision_each = precision_score(
+        y_true, y_pred, labels=labels, average=None, zero_division=0
+    )
+    recall_each = recall_score(
+        y_true, y_pred, labels=labels, average=None, zero_division=0
+    )
+    precision_per_class = {str(c): float(p) for c, p in zip(labels, precision_each)}
+    recall_per_class = {str(c): float(r) for c, r in zip(labels, recall_each)}
+    return {
+        "pr_auc": float(average_precision_score(y_true, y_score)),
+        "precision": float(precision_score(y_true, y_pred, zero_division=0)),
+        "recall": float(recall_score(y_true, y_pred, zero_division=0)),
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "precision_macro": float(np.mean(precision_each)),
+        "recall_macro": float(np.mean(recall_each)),
+        "precision_per_class": precision_per_class,
+        "recall_per_class": recall_per_class,
+        "n_samples": int(len(y_true)),
+    }
+
+
+def evaluate_on_test(
+    model: Pipeline,
+    x_test: pdDataFrame,
+    y_test: np.ndarray,
+) -> dict[str, float]:
+    """Score a fitted pipeline on the held-out test set.
+
+    Takes a single ``predict_proba`` pass and derives the hard label by
+    ``argmax`` of those same probabilities — identical to ``model.predict`` but
+    guaranteed to match the scores PR-AUC is computed from (and, for the BDL
+    model, computed from one MC-dropout pass rather than a second independent
+    one). Applies to any ``predict_proba`` pipeline: XGBoost, and the BDL model
+    evaluated *without* a reject mask.
+
+    Args:
+        model: A pipeline already fitted on the full training set.
+        x_test: The held-out test features (same column layout as training X).
+        y_test: The held-out test labels.
+
+    Returns:
+        A dict of test metrics (``pr_auc``, ``precision``, ``n_samples``).
+
+    """
+    proba = model.predict_proba(x_test)
+    y_pred = model.classes_[np.argmax(proba, axis=1)]
+    return _binary_metrics(y_test, proba[:, 1], y_pred)
+
+
+# Reductions for collapsing the reference set's per-sample Bayes Error into the
+# single scalar that each test datum is compared against. Bayes Error is bounded
+# in [0, 0.5] for binary classification, so "max" tends to saturate near 0.5 and
+# reject nothing; "mean" gives a meaningful operating point to start from.
+_BAYES_ERROR_REDUCTIONS = {
+    "mean": np.mean,
+    "median": np.median,
+    "max": np.max,
+}
+
+
+def bayes_error_reference(
+    model: Pipeline,
+    x_reference: pdDataFrame,
+    reduction: str = "mean",
+) -> float:
+    """Compute the reference Bayes Error from a reference (e.g. training) set.
+
+    Infers ``x_reference`` through the fitted BDL pipeline (one MC-dropout pass
+    via ``MCDropoutClassifier.uncertainty_metrics``) and reduces the per-sample
+    Bayes Error to a single scalar. A test datum is later rejected when its own
+    Bayes Error exceeds this reference (see ``evaluate_bdl_on_test``).
+
+    Args:
+        model: The BDL pipeline fitted on the full training set.
+        x_reference: Features of the reference set (the full training set here).
+        reduction: How to collapse the reference Bayes Errors into one scalar;
+            one of ``"mean"``, ``"median"`` or ``"max"``.
+
+    Returns:
+        The reference Bayes Error scalar.
+
+    """
+    classifier = model[-1]
+    x_pre = model[:-1].transform(x_reference)
+    bayes_error = classifier.uncertainty_metrics(x_pre)["bayes_error"]
+    return float(_BAYES_ERROR_REDUCTIONS[reduction](bayes_error))
+
+
+def _masked_metrics(
+    y_true: np.ndarray,
+    y_score: np.ndarray,
+    y_pred: np.ndarray,
+    keep_mask: np.ndarray,
+) -> dict[str, float | None]:
+    """Score the retained subset, reporting coverage and rejection counts.
+
+    Guards the empty case (every sample rejected), where PR-AUC and precision are
+    undefined, by returning ``None`` for those metrics rather than raising.
+
+    Args:
+        y_true: Ground-truth binary labels for all test samples.
+        y_score: Positive-class probability for all test samples.
+        y_pred: Predicted hard labels for all test samples.
+        keep_mask: Boolean mask, ``True`` where a sample is kept (not rejected).
+
+    Returns:
+        A dict with the retained-subset metrics plus ``coverage`` and
+        ``n_rejected``.
+
+    """
+    result: dict[str, float | None] = {
+        "coverage": float(keep_mask.mean()),
+        "n_rejected": int((~keep_mask).sum()),
+    }
+    if not keep_mask.any():
+        result.update(
+            {
+                "pr_auc": None,
+                "precision": None,
+                "recall": None,
+                "accuracy": None,
+                "precision_macro": None,
+                "recall_macro": None,
+                "precision_per_class": None,
+                "recall_per_class": None,
+                "n_samples": 0,
+            }
+        )
+        return result
+    result.update(
+        _binary_metrics(y_true[keep_mask], y_score[keep_mask], y_pred[keep_mask])
+    )
+    return result
+
+
+def evaluate_bdl_on_test(
+    model: Pipeline,
+    x_test: pdDataFrame,
+    y_test: np.ndarray,
+    reference_bayes_error: float,
+) -> tuple[dict[str, float], dict[str, float | None]]:
+    """Evaluate the BDL pipeline on test, both without and with the reject mask.
+
+    Runs a single MC-dropout pass over the test set via ``uncertainty_metrics``,
+    so the no-mask metrics, the reject-mask metrics and the rejection decision
+    all derive from the same predictive distribution (and the test set is not
+    inferred twice). The hard label is the ``argmax`` of the predictive mean
+    (matching ``predict``). A test datum is rejected when its Bayes Error exceeds
+    ``reference_bayes_error``; the kept subset is scored for the masked metrics.
+
+    Args:
+        model: The BDL pipeline fitted on the full training set (its final step
+            is an ``MCDropoutClassifier``).
+        x_test: The held-out test features (same column layout as training X).
+        y_test: The held-out test labels.
+        reference_bayes_error: The reference scalar from
+            ``bayes_error_reference``.
+
+    Returns:
+        ``(no_mask_metrics, reject_mask_metrics)``. The masked dict also carries
+        ``coverage``, ``n_rejected`` and the ``reference_bayes_error`` applied.
+
+    """
+    classifier = model[-1]
+    x_pre = model[:-1].transform(x_test)
+    metrics = classifier.uncertainty_metrics(x_pre)
+    proba = metrics["mean_proba"]
+    y_score = proba[:, 1]
+    y_pred = classifier.classes_[np.argmax(proba, axis=1)]
+
+    no_mask = _binary_metrics(y_test, y_score, y_pred)
+
+    # Reject any test datum more uncertain (higher Bayes Error) than the
+    # training reference; keep the rest.
+    keep_mask = metrics["bayes_error"] <= reference_bayes_error
+    reject_mask = _masked_metrics(y_test, y_score, y_pred, keep_mask)
+    reject_mask["reference_bayes_error"] = reference_bayes_error
+
+    return no_mask, reject_mask
+
+
+def evaluate_bdl_reject_sweep(
+    model: Pipeline,
+    x_test: pdDataFrame,
+    y_test: np.ndarray,
+    reference_bayes_error: float,
+    multipliers: Sequence[float],
+) -> tuple[dict[str, float], list[dict[str, float | None]]]:
+    """Evaluate the BDL reject mask at several thresholds in a single MC pass.
+
+    Like ``evaluate_bdl_on_test``, but sweeps a set of rejection thresholds
+    instead of one. The test set is inferred *once* (one MC-dropout pass), then
+    each ``multiplier * reference_bayes_error`` is applied as the threshold, so
+    every operating point is scored from the same predictive distribution rather
+    than re-running inference per multiplier. A multiplier of ``1.0`` reproduces
+    ``evaluate_bdl_on_test``'s reject-mask result.
+
+    Args:
+        model: The BDL pipeline fitted on the full training set (its final step
+            is an ``MCDropoutClassifier``).
+        x_test: The held-out test features (same column layout as training X).
+        y_test: The held-out test labels.
+        reference_bayes_error: The base reference scalar from
+            ``bayes_error_reference``; each multiplier scales it.
+        multipliers: The threshold multipliers to evaluate.
+
+    Returns:
+        ``(no_mask_metrics, reject_masks)`` where ``reject_masks`` is one masked
+        metrics dict per multiplier (in the given order). Each dict carries
+        ``multiplier``, the applied ``reference_bayes_error`` (= multiplier *
+        base) and the ``base_reference_bayes_error`` alongside ``coverage`` and
+        ``n_rejected``.
+
+    """
+    classifier = model[-1]
+    x_pre = model[:-1].transform(x_test)
+    metrics = classifier.uncertainty_metrics(x_pre)
+    proba = metrics["mean_proba"]
+    y_score = proba[:, 1]
+    y_pred = classifier.classes_[np.argmax(proba, axis=1)]
+    bayes_error = metrics["bayes_error"]
+
+    no_mask = _binary_metrics(y_test, y_score, y_pred)
+
+    reject_masks: list[dict[str, float | None]] = []
+    for multiplier in multipliers:
+        threshold = reference_bayes_error * multiplier
+        keep_mask = bayes_error <= threshold
+        entry = _masked_metrics(y_test, y_score, y_pred, keep_mask)
+        entry["multiplier"] = float(multiplier)
+        entry["reference_bayes_error"] = float(threshold)
+        entry["base_reference_bayes_error"] = float(reference_bayes_error)
+        reject_masks.append(entry)
+
+    return no_mask, reject_masks
+
+
+def evaluate_bdl_random_mask(
+    model: Pipeline,
+    x_test: pdDataFrame,
+    y_test: np.ndarray,
+    coverage: float,
+    seed: int = 0,
+) -> tuple[dict[str, float], dict[str, float | None]]:
+    """Evaluate the BDL pipeline on test with a *random* reject mask.
+
+    Identical bookkeeping to ``evaluate_bdl_on_test`` -- the same single
+    MC-dropout pass produces ``y_score`` and ``y_pred`` -- but the kept subset is
+    drawn uniformly at random to hit ``coverage`` instead of by Bayes Error. This
+    is the abstention baseline the Bayes-Error reject mask must beat: dropping the
+    same fraction of rows at random leaves the retained-subset metrics changed
+    only by sampling noise (the population is statistically unchanged), so if the
+    reject mask does no better than this at equal coverage, the uncertainty signal
+    is adding nothing.
+
+    Args:
+        model: The BDL pipeline fitted on the full training set (its final step
+            is an ``MCDropoutClassifier``).
+        x_test: The held-out test features (same column layout as training X).
+        y_test: The held-out test labels.
+        coverage: Fraction of rows to keep, in ``[0, 1]``; ``1 - coverage`` are
+            rejected uniformly at random.
+        seed: Seed for the row-dropping RNG, for reproducibility.
+
+    Returns:
+        ``(no_mask_metrics, random_mask_metrics)``. The masked dict also carries
+        ``coverage``, ``n_rejected`` and the requested ``target_coverage``.
+
+    """
+    classifier = model[-1]
+    x_pre = model[:-1].transform(x_test)
+    metrics = classifier.uncertainty_metrics(x_pre)
+    proba = metrics["mean_proba"]
+    y_score = proba[:, 1]
+    y_pred = classifier.classes_[np.argmax(proba, axis=1)]
+
+    no_mask = _binary_metrics(y_test, y_score, y_pred)
+
+    # Keep a uniformly-random subset of the requested size, ignoring uncertainty.
+    n = len(y_test)
+    n_keep = int(round(coverage * n))
+    keep_mask = np.zeros(n, dtype=bool)
+    keep_idx = np.random.default_rng(seed).choice(n, size=n_keep, replace=False)
+    keep_mask[keep_idx] = True
+    random_mask = _masked_metrics(y_test, y_score, y_pred, keep_mask)
+    random_mask["target_coverage"] = float(coverage)
+
+    return no_mask, random_mask
+
+
+# Default coverage grid for the risk--coverage sweep: every abstention rule is
+# evaluated at these exact retained fractions, so the curves are directly
+# comparable. Stops at 0.80 because below that the retained set can shed the
+# whole positive class on this imbalance, making balanced error undefined.
+_DEFAULT_RISK_COVERAGES = (1.0, 0.99, 0.98, 0.97, 0.95, 0.93, 0.90, 0.85, 0.80)
+
+
+def _balanced_error(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Balanced error rate ``1 - 0.5*(TPR + TNR)`` for binary 0/1 labels.
+
+    Prevalence-robust (each class contributes equally regardless of how the
+    abstention rule reshaped the retained class balance), unlike plain error
+    which the majority class dominates. Returns ``nan`` when the retained subset
+    lacks a class, since the rate for that class is undefined -- honest about
+    degenerate coverage rather than averaging over whichever class survived.
+    """
+    pos = y_true == 1
+    neg = ~pos
+    if not pos.any() or not neg.any():
+        return float("nan")
+    tpr = float((y_pred[pos] == 1).mean())
+    tnr = float((y_pred[neg] == 0).mean())
+    return 1.0 - 0.5 * (tpr + tnr)
+
+
+def _aurc(coverages: Sequence[float], risks: Sequence[float]) -> float:
+    """Trapezoidal area under the risk--coverage curve. Lower is better.
+
+    Integrates ``risk`` against ``coverage`` using only finite points, so an
+    undefined balanced error at aggressive coverage drops out instead of
+    poisoning the whole area.
+    """
+    cov = np.asarray(coverages, dtype=float)
+    rk = np.asarray(risks, dtype=float)
+    finite = np.isfinite(rk)
+    if int(finite.sum()) < 2:
+        return float("nan")
+    order = np.argsort(cov[finite])
+    return float(np.trapezoid(rk[finite][order], cov[finite][order]))
+
+
+def _risk_coverage_bootstrap(
+    out: dict[str, Any],
+    methods: dict[str, tuple[str, np.ndarray]],
+    preds: dict[str, tuple[np.ndarray, np.ndarray]],
+    y_true: np.ndarray,
+    coverages: Sequence[float],
+    n_bootstrap: int,
+    seed: int,
+) -> None:
+    """Add bootstrap error bars to a ``risk_coverage_sweep`` result, in place.
+
+    Resamples the test rows with replacement ``n_bootstrap`` times and re-runs
+    each method's coverage thresholding on the resample (the per-row scores are
+    fixed; only the row sample varies), recomputing balanced error -- cheaply,
+    skipping the descriptive PR-AUC/precision in the loop. Writes ``risk_lo`` /
+    ``risk_hi`` (2.5/97.5 percentiles) per point and ``aurc_boot_mean`` /
+    ``aurc_boot_std`` per method, plus the raw per-resample AURC draws
+    (``aurc_boot_samples``). Every method shares the same resample ``idx`` at
+    iteration ``b``, so the draws are *paired* across methods (aligned by index):
+    a proper paired test of one rule against another is
+    ``samples_A[b] - samples_B[b]``, which cancels the shared row-sampling noise
+    and is far more powerful than treating the two AURCs as independent.
+    """
+    n = len(y_true)
+    n_cov = len(coverages)
+    rng = np.random.default_rng(seed + 1)
+    risks = {name: np.full((n_bootstrap, n_cov), np.nan) for name in methods}
+    aurcs = {name: np.full(n_bootstrap, np.nan) for name in methods}
+    for b in range(n_bootstrap):
+        idx = rng.integers(0, n, size=n)
+        y_resampled = y_true[idx]
+        for name, (src, uncertainty) in methods.items():
+            _, y_pred = preds[src]
+            y_pred_resampled = y_pred[idx]
+            # Random rule: redraw its noise per resample so the band reflects
+            # both row resampling and the arbitrary draw.
+            unc = rng.random(n) if name == "random" else uncertainty[idx]
+            order = np.argsort(unc, kind="stable")
+            for j, coverage in enumerate(coverages):
+                keep = order[: int(round(coverage * n))]
+                risks[name][b, j] = _balanced_error(
+                    y_resampled[keep], y_pred_resampled[keep]
+                )
+            aurcs[name][b] = _aurc(coverages, risks[name][b])
+    for name in methods:
+        lo = np.nanpercentile(risks[name], 2.5, axis=0)
+        hi = np.nanpercentile(risks[name], 97.5, axis=0)
+        for j, point in enumerate(out["methods"][name]["points"]):
+            point["risk_lo"] = float(lo[j])
+            point["risk_hi"] = float(hi[j])
+        out["methods"][name]["aurc_boot_mean"] = float(np.nanmean(aurcs[name]))
+        out["methods"][name]["aurc_boot_std"] = float(np.nanstd(aurcs[name]))
+        # Raw paired draws for downstream paired tests; non-finite -> null so the
+        # JSON stays standard and the consumer can drop those resamples.
+        out["methods"][name]["aurc_boot_samples"] = [
+            float(a) if np.isfinite(a) else None for a in aurcs[name]
+        ]
+
+
+def risk_coverage_sweep(  # noqa: PLR0913
+    bdl_model: Pipeline,
+    xgb_model: Pipeline,
+    x_test: pdDataFrame,
+    y_test: np.ndarray,
+    coverages: Sequence[float] | None = None,
+    n_bootstrap: int = 0,
+    seed: int = 0,
+) -> dict[str, Any]:
+    """Risk--coverage curves for several abstention rules at matched coverage.
+
+    The point of the BDL reject-mask experiment isn't "does rejecting help?"
+    (trivially yes -- you drop hard cases) but "does the BDL *uncertainty* pick
+    which rows to drop better than cheaper rules?" This evaluates every rule at
+    the *same* retained fractions so their curves are directly comparable, all
+    from a single MC-dropout pass over the test set (no retraining):
+
+      * ``random``             -- drop rows uniformly (the floor every rule must beat)
+      * ``bayes_error``        -- 1 - max predictive prob (≈ confidence margin)
+      * ``predictive_entropy`` -- H(p̄), the entropy-flavoured confidence
+      * ``bald``               -- epistemic disagreement across MC passes
+      * ``epistemic_var``      -- per-pass probability variance (epistemic)
+      * ``xgb_margin``         -- XGBoost's own confidence (its predictions kept)
+
+    ``bayes_error``/``predictive_entropy`` are level-based confidence -- what a
+    non-Bayesian model gives for free -- so ``bald``/``epistemic_var`` must beat
+    *them* (not just ``random``) for the MC-dropout machinery to earn its cost.
+    The risk is balanced error (prevalence-robust; see ``_balanced_error``) and
+    each curve is summarised by its AURC (lower is better).
+
+    Args:
+        bdl_model: The fitted BDL pipeline (final step an ``MCDropoutClassifier``).
+        xgb_model: The fitted XGBoost pipeline, for the cross-model baseline.
+        x_test: Held-out test features.
+        y_test: Held-out test labels.
+        coverages: Retained fractions to evaluate; defaults to
+            ``_DEFAULT_RISK_COVERAGES``.
+        n_bootstrap: Test-set bootstrap resamples for error bars (0 = none).
+        seed: Seed for the random rule and the bootstrap.
+
+    Returns:
+        A dict with ``coverages``, ``risk_metric``, ``n_test`` and ``methods``
+        (each carrying ``predictions``, ``aurc``, ``points``, and -- when
+        bootstrapped -- ``aurc_boot_mean``/``aurc_boot_std`` and per-point bands).
+
+    """
+    coverages = tuple(_DEFAULT_RISK_COVERAGES if coverages is None else coverages)
+    y_true = np.asarray(y_test).astype(int)
+    n = len(y_true)
+    rng = np.random.default_rng(seed)
+
+    # One MC-dropout pass: every BDL score from the same predictive distribution.
+    classifier = bdl_model[-1]
+    mc = classifier.uncertainty_metrics(bdl_model[:-1].transform(x_test))
+    bdl_proba = mc["mean_proba"]
+    bdl_score = bdl_proba[:, 1]
+    bdl_pred = classifier.classes_[np.argmax(bdl_proba, axis=1)].astype(int)
+
+    # One XGBoost pass for the cross-model selective baseline (its own decisions).
+    xgb_proba = xgb_model.predict_proba(x_test)
+    xgb_pred = xgb_model.classes_[np.argmax(xgb_proba, axis=1)].astype(int)
+
+    # name -> (predictions source, per-row uncertainty where higher = reject first)
+    methods: dict[str, tuple[str, np.ndarray]] = {
+        "random": ("bdl", rng.random(n)),
+        "bayes_error": ("bdl", mc["bayes_error"]),
+        "predictive_entropy": ("bdl", mc["predictive_entropy"]),
+        "bald": ("bdl", mc["bald"]),
+        "epistemic_var": ("bdl", mc["epistemic_var"]),
+        "xgb_margin": ("xgb", 1.0 - xgb_proba.max(axis=1)),
+    }
+    preds: dict[str, tuple[np.ndarray, np.ndarray]] = {
+        "bdl": (bdl_score, bdl_pred),
+        "xgb": (xgb_proba[:, 1], xgb_pred),
+    }
+
+    out: dict[str, Any] = {
+        "coverages": [float(c) for c in coverages],
+        "risk_metric": "balanced_error",
+        "n_test": int(n),
+        "methods": {},
+    }
+    for name, (src, uncertainty) in methods.items():
+        y_score, y_pred = preds[src]
+        order = np.argsort(uncertainty, kind="stable")  # most certain kept first
+        points: list[dict[str, Any]] = []
+        risks: list[float] = []
+        for coverage in coverages:
+            keep_mask = np.zeros(n, dtype=bool)
+            keep_mask[order[: int(round(coverage * n))]] = True
+            metrics = _masked_metrics(y_true, y_score, y_pred, keep_mask)
+            kept_true = y_true[keep_mask]
+            balanced_error = _balanced_error(kept_true, y_pred[keep_mask])
+            accuracy = metrics.get("accuracy")
+            points.append(
+                {
+                    "coverage_requested": float(coverage),
+                    "coverage": metrics["coverage"],
+                    "n_samples": metrics.get("n_samples"),
+                    "prevalence": float(kept_true.mean()) if keep_mask.any() else None,
+                    "balanced_error": balanced_error,
+                    "selective_error": None if accuracy is None else 1.0 - accuracy,
+                    "pr_auc": metrics.get("pr_auc"),
+                    "precision": metrics.get("precision"),
+                    "recall": metrics.get("recall"),
+                }
+            )
+            risks.append(balanced_error)
+        out["methods"][name] = {
+            "predictions": src,
+            "aurc": _aurc(coverages, risks),
+            "points": points,
+        }
+
+    if n_bootstrap > 0:
+        _risk_coverage_bootstrap(
+            out, methods, preds, y_true, coverages, n_bootstrap, seed
+        )
+    return out
+
+
+def compare_models_on_test(  # noqa: PLR0913
+    xgb_model: Pipeline,
+    bdl_model: Pipeline,
+    x_reference: pdDataFrame,
+    x_test: pdDataFrame,
+    y_test: np.ndarray,
+    dirpath: Path,
+    reduction: str = "mean",
+) -> dict[str, dict[str, float]]:
+    """Evaluate XGBoost and BDL (with and without reject mask) on the test set.
+
+    Surfaces PR-AUC and precision for three configurations side by side and
+    persists them to ``test_comparison.json`` in ``dirpath`` for comparison:
+    ``xgboost``, ``bdl_no_reject_mask`` and ``bdl_reject_mask``. The reject mask
+    rejects a test datum whose Bayes Error exceeds the reference computed from
+    ``x_reference``.
+
+    ``x_reference`` no longer has to be the full training set: it is whatever
+    matrix a :class:`~utils.reference_sets.ReferenceSpec` resolved to. Pass the
+    matching ``reference_provenance`` (from ``resolve_reference``) so the saved
+    comparison records *which* reference subset it was calibrated against, under a
+    ``"reference"`` key, instead of leaving it implicit.
+
+    Args:
+        xgb_model: The XGBoost pipeline fitted on the full training set.
+        bdl_model: The BDL pipeline fitted on the full training set.
+        x_reference: The reference features for the BDL Bayes Error reference
+            (the full training set, or a resolved subset of interest).
+        x_test: The held-out test features (same column layout as training X).
+        y_test: The held-out test labels.
+        dirpath: Directory to write the comparison JSON into.
+        reduction: How to reduce the reference Bayes Errors to one scalar
+            (passed to ``bayes_error_reference``).
+        reference_provenance: Optional provenance dict (from
+            ``resolve_reference``) describing how ``x_reference`` was selected;
+            embedded in the output under ``"reference"`` when given.
+
+    Returns:
+        A dict keyed by configuration name, each holding that config's metrics
+        (plus a ``"reference"`` entry when ``reference_provenance`` is provided).
+
+    """
+    reference = bayes_error_reference(bdl_model, x_reference, reduction=reduction)
+    bdl_no_mask, bdl_reject_mask = evaluate_bdl_on_test(
+        bdl_model, x_test, y_test, reference
+    )
+    results: dict[str, Any] = {
+        "xgboost": evaluate_on_test(xgb_model, x_test, y_test),
+        "bdl_no_reject_mask": bdl_no_mask,
+        "bdl_reject_mask": bdl_reject_mask,
+    }
+
+    dirpath.mkdir(parents=True, exist_ok=True)
+    file_path = dirpath / _TEST_COMPARISON_FILENAME
+    with file_path.open("w") as f:
+        json.dump(results, f, indent=4)
+
+    return results

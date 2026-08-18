@@ -1,0 +1,13 @@
+{
+    "best_score": 0.5981466480981134,
+    "best_params": {
+        "classifier__colsample_bytree": 0.8430179407605753,
+        "classifier__gamma": 1.7052412368729153,
+        "classifier__learning_rate": 0.029515477895583855,
+        "classifier__max_depth": 6,
+        "classifier__n_estimators": 700,
+        "classifier__reg_alpha": 0.1,
+        "classifier__reg_lambda": 0.001,
+        "classifier__subsample": 0.7541666010159664
+    }
+}
